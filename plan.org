@@ -1,0 +1,11 @@
+* Customize columns in resources view
+* Filtering by arbitrary fields (to enable pod filtered by nodename)
+* Jump to children
+* Jump to owner
+* Jump to node from pod view
+* Sorting by arbitrary columns
+* Option for filtering not to gray out things but hide them completely
+* All namespaces option
+See https://github.com/linktohack/kubel/commit/bdf20c1077dad697be0ddda99455739cb08788be
+(https://github.com/abrochard/kubel/issues/111)
+* Fix annoying errors if no resources
