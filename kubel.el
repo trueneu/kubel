@@ -26,7 +26,7 @@
 ;; Keywords: kubernetes k8s tools processes
 ;; URL: https://github.com/abrochard/kubel
 ;; License: GNU General Public License >= 3
-;; Package-Requires: ((transient "0.1.0") (emacs "25.3") (dash "2.12.0") (s "1.2.0") (yaml-mode "0.0.14"))
+;; Package-Requires: ((transient "0.1.0") (emacs "25.3") (dash "2.12.0") (s "1.2.0") (yaml-mode "0.0.14") (ht "2.4") (asoc "0.6.1"))
 
 ;;; Commentary:
 
@@ -109,6 +109,8 @@
 (require 'eshell)
 (require 'dired)
 (require 'json)
+(require 'ht)
+(require 'asoc)
 
 (defgroup kubel nil "Customisation group for kubel."
   :group 'extensions)
@@ -208,6 +210,24 @@
                 :value-type face)
   :group 'kubel)
 
+(defface kubel-percentage-warning-face
+  '((default . (:inherit warning)))
+  "The face to use for warning percentages.")
+
+(defface kubel-percentage-critical-face
+  '((default . (:inherit error)))
+  "The face to use for critical percentages.")
+
+(defcustom kubel-percentage-critical-threshold 90
+  "Threshold for critical percentage values."
+  :type 'integer
+  :group 'kubel)
+
+(defcustom kubel-percentage-warning-threshold 70
+  "Threshold for warning percentage values."
+  :type 'integer
+  :group 'kubel)
+
 (defcustom kubel-kubectl "kubectl"
   "Kubectl binary path."
   :type '(file :must-match t)
@@ -226,6 +246,11 @@
   :type 'integer
   :group 'kubel)
 
+(defcustom kubel-log-max-log-requests 50
+  "Max number of parallel log tails."
+  :type 'integer
+  :group 'kubel)
+
 (defcustom kubel-list-wide nil
   "Control whether list views show additional colums.
 
@@ -233,7 +258,6 @@ true   - use '-o wide' for list views to show additional columns
 false  - do not use '-o wide' for list views, hiding additional columns"
   :type 'boolean
   :group 'kubel)
-
 
 (defcustom kubel-use-namespace-list 'auto
   "Control behavior for namespace completion.
@@ -268,6 +292,11 @@ This is used by `kubel-kill-buffer'."
   :type 'boolean
   :group 'kubel)
 
+(defcustom kubel-filter-hides nil
+  "Non-nil means that if filter is applied, non-matching lines are hidden."
+  :type 'boolean
+  :group 'kubel)
+
 (defun kubel--append-to-process-buffer (str)
   "Append string STR to the process buffer."
   (with-current-buffer (get-buffer-create kubel--process-buffer)
@@ -275,7 +304,48 @@ This is used by `kubel-kill-buffer'."
     (goto-char (point-max))
     (insert (format "%s\n" str))))
 
+(defvar-local kubel--global-resources-set-cached (ht)
+  "Hashset of resources that are global, i.e. not namespaced")
+
 (defvar-local kubel--last-command nil)
+
+;; TODO fill this in
+(defvar kubel--internal-type-ownership-alist
+  '((deployments . pods)
+    (replicasets . pods)
+    (daemonsets . pods)))
+
+;; TODO fill this in
+(defvar kubel--internal-type-resource-type-alias-alist
+  '((deployments . ("Deployments" "deployments" "deployments.apps"))
+    (replicasets . ("ReplicaSets" "replicasets" "replicasets.apps"))
+    (daemonsets . ("DaemonSets" "daemonsets" "daemonsets.apps"))
+    (pods . ("Pods" "pods"))))
+
+;; TODO fill this in
+(defvar kubel--resource-type-singular->plural-ht
+  (ht ("Deployment" "Deployments")
+      ("deployment" "deployments")
+      ("ReplicaSet" "ReplicaSets")
+      ("replicaset" "replicasets")
+      ("DaemonSet" "DaemonSets")
+      ("daemonset" "daemonsets")))
+
+(defvar kubel--resource-type->aliases-ht
+  (let ((result (ht)))
+    (dolist (aliases kubel--internal-type-resource-type-alias-alist result)
+      (dolist (alias (cdr aliases))
+        (dolist (resource-type (cdr aliases))
+          (setf (ht-get result resource-type)
+                (cons alias (ht-get result resource-type))))))))
+
+(defvar kubel--resource-type->internal-type-ht
+  (let ((result (ht)))
+    (dolist (aliases kubel--internal-type-resource-type-alias-alist result)
+      (dolist (alias (cdr aliases))
+        (ht-set result alias (car aliases))))))
+
+(defvar-local kubel--last-parent nil)
 
 (defun kubel--log-command (process-name cmd)
   "Log the kubectl command to the process buffer.
@@ -287,6 +357,8 @@ CMD is the kubectl command as a list."
     (kubel--append-to-process-buffer
      (format "[%s]\ncommand: %s" process-name str-cmd))))
 
+(defvar kubel--output-buffer-name "*kubel-output*")
+
 (defun kubel--exec-to-string (cmd)
   "Replace \"shell-command-to-string\" to log to process buffer.
 
@@ -294,13 +366,13 @@ CMD is the command string to run."
   (kubel--log-command "kubectl-command" cmd)
   (with-output-to-string
     (with-current-buffer standard-output
-      (shell-command cmd t "*kubel stderr*"))))
+      (shell-command cmd t kubel--output-buffer-name))))
 
 (defvar-local kubel-namespace "default"
   "Current namespace.")
 
-(defvar-local kubel-resource "pods"
-  "Current resource.")
+(defvar-local kubel-resource-type "pods"
+  "Current resource type.")
 
 (defvar-local kubel-context
   (replace-regexp-in-string
@@ -308,10 +380,13 @@ CMD is the command string to run."
   "Current context.  Tries to smart default.")
 
 (defvar-local kubel-resource-filter ""
-  "Substring filter for resource name.")
+  "Regex filter for resource view.")
 
-(defvar-local kubel-selector ""
-  "Label selector for resources.")
+(defvar-local kubel-selectors nil
+  "Label selectors for resources.")
+
+(defvar-local kubel-field-selectors ""
+  "Field selectors for resources.")
 
 (defvar kubel-namespace-history '()
   "List of previously used namespaces.")
@@ -325,31 +400,548 @@ CMD is the command string to run."
 
 (defvar-local kubel--label-values-cached nil)
 
-(defvar-local kubel--selected-items '())
+(defvar-local kubel--selected-items-set (ht)
+  "Hashet containing all the currently selected items.")
 
-(defvar-local kubel--kubernetes-resources-list-cached nil)
+(defvar-local kubel--kubernetes-api-resources-list-cached nil)
 
-(defun kubel--kubernetes-resources-list ()
+(defvar-local kubel--all-namespaces-view nil
+  "Non-nil if current view is for all namespaces AND has NAMESPACE column.")
+
+(defvar kubel--all-namespaces-entry "*ALL*"
+  "Special entry for all namespaces in the namespace list. Must be illegal
+from k8s point of view to avoid clashes.")
+
+(defvar-local kubel--ns-name->columns-alist (ht)
+  "Hashtable of (ns . name) to columns alist of all items in the view.")
+
+(defvar-local kubel--ns-name->visible (ht)
+  "Hashtable of (ns . name) to visible flag all items in the view.")
+
+(defvar kubel--complex-views (ht ("pods" `((table-columns . ("NAME" "READY" "STATUS" "RESTARTS" "CPU(r)" "CPU(l)" "MEM(r)" "MEM(l)" "NODE" "AGE"))
+                                           (calls . (((type . get-wide))
+                                                     ((type . jsonpath-repeated-columns)
+                                                      (spec . "'{range .items[*]}{.metadata.namespace} {.metadata.name}{range .spec.containers[*]} {.resources.requests.cpu} {.resources.requests.memory} {.resources.limits.cpu} {.resources.limits.memory}{end}{\"\\n\"}{end}'")
+                                                      (static-columns . ("NAMESPACE" "NAME"))
+                                                      (repeated-columns . ("CPUREQ" "MEMREQ" "CPULIM" "MEMLIM"))
+                                                      (pre-process . (("CPUREQ" . ,(lambda (acc arg)
+                                                                                    (let ((number (kubel--convert-cpu-units-millis arg)))
+                                                                                      (+ acc number))))
+                                                                      ("MEMREQ" . ,(lambda (acc arg)
+                                                                                     (let ((number (kubel--convert-size-units-bytes arg)))
+                                                                                       (+ acc number))))
+                                                                      ("CPULIM" . ,(lambda (acc arg)
+                                                                                    (let ((number (kubel--convert-cpu-units-millis arg)))
+                                                                                      (+ acc number))))
+                                                                      ("MEMLIM" . ,(lambda (acc arg)
+                                                                                     (let ((number (kubel--convert-size-units-bytes arg)))
+                                                                                       (+ acc number))))))
+                                                      (post-process . (("CPUREQ" . ,(lambda (arg)
+                                                                                      (kubel--convert-cpu-units-str arg)))
+                                                                       ("MEMREQ" . ,(lambda (arg)
+                                                                                      (kubel--convert-size-units-str arg)))
+                                                                       ("CPULIM" . ,(lambda (arg)
+                                                                                      (kubel--convert-cpu-units-str arg)))
+                                                                       ("MEMLIM" . ,(lambda (arg)
+                                                                                      (kubel--convert-size-units-str arg))))))
+
+
+                                                                                                                      ;; FIXME: this won't work with recursive descent
+                                                     ;; ((type . jsonpath)
+                                                     ;;  (spec . "'{range .items[*]}{.metadata.namespace} {.metadata.name} {..resources.requests.cpu} {..resources.requests.memory}{\"\\n\"}{end}'")
+                                                     ;;  (columns . ("NAMESPACE" "NAME" "CPUREQ" "MEMREQ")))
+                                                     ((type . top))))
+                                           (post-process . (,(lambda (item)
+                                                               (let ((cpu-usage-str (ht-get item "CPU(cores)" "-"))
+                                                                     (cpu-req-str (ht-get item "CPUREQ" "-")))
+                                                                 (ht-set item "CPU(r)" (concat
+                                                                                        (kubel--ratio
+                                                                                         (kubel--convert-cpu-units-millis cpu-usage-str)
+                                                                                         (kubel--convert-cpu-units-millis cpu-req-str))
+                                                                                        " ("
+                                                                                        cpu-usage-str
+                                                                                        "/"
+                                                                                        cpu-req-str
+                                                                                        ")")))
+                                                               (let ((mem-usage-str (ht-get item "MEMORY(bytes)" "-"))
+                                                                     (mem-req-str (ht-get item "MEMREQ" "-")))
+                                                                 (ht-set item "MEM(r)" (concat
+                                                                                        (kubel--ratio
+                                                                                         (kubel--convert-size-units-bytes mem-usage-str)
+                                                                                         (kubel--convert-size-units-bytes mem-req-str))
+                                                                                        " ("
+                                                                                        mem-usage-str
+                                                                                        "/"
+                                                                                        mem-req-str
+                                                                                        ")")))
+                                                               (let ((cpu-usage-str (ht-get item "CPU(cores)" "-"))
+                                                                     (cpu-lim-str (ht-get item "CPULIM" "-")))
+                                                                 (ht-set item "CPU(l)" (concat
+                                                                                        (kubel--ratio
+                                                                                         (kubel--convert-cpu-units-millis cpu-usage-str)
+                                                                                         (kubel--convert-cpu-units-millis cpu-lim-str))
+                                                                                        " ("
+                                                                                        cpu-usage-str
+                                                                                        "/"
+                                                                                        cpu-lim-str
+                                                                                        ")")))
+                                                               (let ((mem-usage-str (ht-get item "MEMORY(bytes)" "-"))
+                                                                     (mem-lim-str (ht-get item "MEMREQ" "-")))
+                                                                 (ht-set item "MEM(l)" (concat
+                                                                                        (kubel--ratio
+                                                                                         (kubel--convert-size-units-bytes mem-usage-str)
+                                                                                         (kubel--convert-size-units-bytes mem-lim-str))
+                                                                                        " ("
+                                                                                        mem-usage-str
+                                                                                        "/"
+                                                                                        mem-lim-str
+                                                                                        ")"))))))))
+                                 ("nodes" `((table-columns . ("NAME" "STATUS" "ROLES" "CPU" "MEM" "AGE"))
+                                            (calls . (((type . get))
+                                                      ((type . custom)
+                                                       (spec . "NAME:.metadata.name,CPUALLOC:.status.allocatable.cpu,MEMALLOC:.status.allocatable.memory"))
+                                                      ((type . top))))
+                                            (post-process . (,(lambda (item)
+                                                                (let ((cpu-usage-str (ht-get item "CPU(cores)" ""))
+                                                                      (cpu-alloc-str (ht-get item "CPUALLOC" "")))
+                                                                  (ht-set item "CPU" (concat
+                                                                                      (kubel--convert-cpu-units-str
+                                                                                       (kubel--convert-cpu-units-millis
+                                                                                        cpu-usage-str))
+                                                                                      "/"
+                                                                                      (kubel--convert-cpu-units-str
+                                                                                       (kubel--convert-cpu-units-millis
+                                                                                        cpu-alloc-str))
+                                                                                      " ("
+                                                                                      (kubel--ratio
+                                                                                       (kubel--convert-cpu-units-millis cpu-usage-str)
+                                                                                       (kubel--convert-cpu-units-millis cpu-alloc-str))
+                                                                                      ")")))
+                                                                (let ((mem-usage-str (ht-get item "MEMORY(bytes)" ""))
+                                                                      (mem-alloc-str (ht-get item "MEMALLOC" "")))
+                                                                  (ht-set item "MEM" (concat
+                                                                                      (kubel--convert-size-units-str
+                                                                                       (kubel--convert-size-units-bytes
+                                                                                        mem-usage-str))
+                                                                                      "/"
+                                                                                      (kubel--convert-size-units-str
+                                                                                       (kubel--convert-size-units-bytes
+                                                                                        mem-alloc-str))
+                                                                                      " ("
+                                                                                      (kubel--ratio
+                                                                                       (kubel--convert-size-units-bytes mem-usage-str)
+                                                                                       (kubel--convert-size-units-bytes mem-alloc-str))
+                                                                                      ")")))))))))
+  "The structure to define complex resource type views (i.e. consisting
+more than one kubectl get call).
+
+The shape of the structure is as follows:
+
+top-level hashtable key is the resource type,
+entry points at view alist, which MUST have:
+
+ - table-columns entry, with value of list of displayed columns,
+ - calls, with list of calls kubel must make.
+
+It MAY have:
+
+ - post-process entry, with alist of functions shaping the table as the
+final step before displaying.
+
+calls is a list of alists. Internal alists must have a type key, which
+may be one of the following:
+
+ - get, to perform a naked get
+ - get-wide, to perform a get with -o wide
+ - custom, to perform a custom-columns call
+ - jsonpath, to perform a jsonpath call
+ - jsonpath-repeated-columns, to perform a more complex ranged jsonpath
+call.
+
+get or get-wide are basic calls and must appear first in the alist.
+
+custom call has one additional key, spec which is the definition of
+custom columns as they will appear on the kubectl call. NAMESPACE and
+NAME should appear as the first columns, where appropriate. This is
+because (NAMESPACE . NAME) cons cell will be used to map different call
+results.
+
+jsonpath call has spec and columns keys. spec is the jsonpath for
+kubectl call, and columns are names for the values from the call. All
+values in jsonpath must be divided by a single whitespace, with
+NAMESPACE and NAME appearing first.
+
+jsonpath-repeated-columns has spec, static-columns, repeated-columns,
+pre-process and post-process fields. spec is as above, static-columns
+are the ones not participating in {range} queries, and repeated-columns
+are the ones that do. Try out the pods example to get a better
+understanding.
+
+pre-process and post-process are alists of their own, with column names
+as keys, and functions of two arguments as values for pre-process, and
+of one for post-process. For pre-process, functions will be called with
+first argument as an accumulator (integer), and second as a literal
+value of a given column (string), for each repeated column. For
+post-process, each function will be called once to form the final value
+of the column after the call.
+
+Global post-process entry (per resource-type) defines any final
+transformations that apply to entries before displaying the table. it
+contains a single function as a value, that will get a hashtable of each
+entry as an argument. You can use this to define new columns, or alter
+existing ones.
+
+Any columns starting with \"CPU\" or \"MEM\" will have percentage
+propertizing applied.
+
+See also `kubel--make-view-calls'.
+")
+
+(defcustom kubel-enable-complex-views t
+  "If set, enables complex views for various resource types."
+  :type 'boolean
+  :group 'kubel)
+
+(defun toggle-kubel-complex-views ()
+  (interactive)
+  (setq kubel-enable-complex-views (not kubel-enable-complex-views))
+  (message "Kubel complex views %s" (if kubel-enable-complex-views "enabled" "disabled")))
+
+(defun kubel--resource-type-global? (resource-type)
+  "Utility function to determine if the current resource type is global."
+  (ht-get (kubel--get-global-resources-set) resource-type nil))
+
+;; TODO fill this in
+(defvar kubel--op->buffer-action
+  '((delete . accumulate)
+    (apply . accumulate)
+    (patch . accumulate)
+    (scale . accumulate)
+    (logs-follow . pop-comint))
+  "Assoc list of operations to what to do with the operation results.
+Default is pop. See `kubel--exec'.")
+
+(defun kubel--kubernetes-api-resources-list ()
   "Get list of resources from cache or from fetching the api resource."
-  (if (null kubel--kubernetes-resources-list-cached)
-      (setq kubel--kubernetes-resources-list-cached
+  (if (null kubel--kubernetes-api-resources-list-cached)
+      (setq kubel--kubernetes-api-resources-list-cached
             (kubel--fetch-api-resource-list))
-    kubel--kubernetes-resources-list-cached))
+    kubel--kubernetes-api-resources-list-cached))
 
 (defun kubel--invalidate-context-caches ()
   "Invalidate the context caches."
-  (setq kubel--kubernetes-resources-list-cached nil)
+  (setq kubel--kubernetes-api-resources-list-cached nil)
   (setq kubel--can-get-namespace-cached nil)
   (setq kubel--namespace-list-cached nil)
-  (setq kubel--label-values-cached nil))
+  (setq kubel--label-values-cached nil)
+  (setq kubel--global-resources-set-cached (ht)))
 
-(defun kubel--populate-list ()
-  "Return a list with a tabulated list format and \"tabulated-list-entries\"."
-  (let*  ((body (kubel--exec-to-string (concat (kubel--get-command-prefix) " get " kubel-resource (if kubel-list-wide " -o wide" ""))))
-          (entrylist (kubel--parse-body body)))
-    (when (string-prefix-p "No resources found" body)
-      (message "No resources found"))  ;; TODO exception here
-    (list (kubel--get-list-format entrylist) (kubel--get-list-entries entrylist))))
+(defvar-local kubel--entrylist-cache nil)
+
+(defvar-local kubel--last-column-sorted nil
+  "If not nil, sort by this column after refresh.")
+
+(defun kubel-sort-by-column-at-point ()
+  (interactive)
+  (let* ((colname (get-text-property (point) 'tabulated-list-column-name))
+         (colnum (tabulated-list--column-number colname)))
+    (setq kubel--last-column-sorted colnum)
+    (tabulated-list-sort colnum)))
+
+(defun kubel-sort-revert ()
+  (interactive)
+  (setq kubel--last-column-sorted nil)
+  (kubel-refresh t))
+
+(defun kubel--parsed-body-to-ns-name-ht (body)
+  (let* ((header (car body))
+         (entries (cdr body))
+         (ns nil)
+         (name nil)
+         (res (ht))
+         (single-entry-ht (ht)))
+    (mapc
+     (lambda (entry)
+       (cl-mapc
+        (lambda (key value)
+          (cond ((s-equals? "NAMESPACE" key)
+                 (setq ns value)
+                 (ht-set single-entry-ht key value))
+                ((s-equals? "NAME" key)
+                 (setq name value)
+                 (ht-set single-entry-ht key value))
+                ;; FIXME: hack to work around kubel--parse-body behaviour with "top"
+                ((s-blank? key))
+                (t
+                 (ht-set single-entry-ht key value))))
+
+        header
+        entry)
+       ;; TODO: optimize to not copy ht
+       (ht-set res (cons (if (and (not kubel--all-namespaces-view)
+                                  (null ns))
+                             kubel-namespace ns) name)
+               (ht-copy single-entry-ht))
+       (ht-clear single-entry-ht))
+     entries)
+    res))
+
+(defun kubel--make-view-calls ()
+  "A function to make all the calls needed to form the view. Returns a list
+properly formatted for future display in tabulated-list-mode.
+
+This function executes kubectl for each call defined in the complex
+view, and saves or merges the result into a nested hashtable of (ns .
+name)->column->value. It all calls all the pre- and post-process
+functions per kubectl call.
+
+At the end, it calls the resource-type post-process functions, and
+restructures the list with respect to columns ordering, returning a list
+of lists, with the first one being a header, and rest being rows.
+
+The function is very heavy, as it does multiple hashtable operations per
+each element of the view, including invisible ones (so keep the
+invisible ones to the minimum)."
+  (if (or (not kubel-enable-complex-views)
+          (not (ht-contains? kubel--complex-views kubel-resource-type)))
+      (kubel--parse-body
+        (kubel--exec-to-string (concat (kubel--kubectl-prefix kubel-namespace)
+                                       " get " kubel-resource-type (kubel--kubectl-suffix))))
+    (let* ((call-spec (ht-get kubel--complex-views kubel-resource-type))
+           (table-columns (append (if (kubel--all-namespaces?) '("NAMESPACE"))
+                                  (asoc-get call-spec 'table-columns)))
+           (post-process-fns (asoc-get call-spec 'post-process))
+           (calls (asoc-get call-spec 'calls))
+           (res (ht)))
+      (dolist (call calls)
+        ;; (message "current ht: %s" res)
+        (let ((type (asoc-get call 'type)))
+          (cond ((eq type 'get)
+                 ;; TODO: make kubel--exec more flexible to avoid rebind
+                 (let* ((kubel-list-wide nil)
+                        (body (kubel--exec-to-string (concat (kubel--kubectl-prefix kubel-namespace)
+                                                             " get " kubel-resource-type (kubel--kubectl-suffix))))
+                        (parsed (kubel--parse-body body))
+                        (hashtable (kubel--parsed-body-to-ns-name-ht parsed)))
+                   (setq res hashtable)))
+                ((eq type 'get-wide)
+                 (let* ((kubel-list-wide t)
+                        (body (kubel--exec-to-string (concat (kubel--kubectl-prefix kubel-namespace)
+                                                             " get " kubel-resource-type (kubel--kubectl-suffix))))
+                        (parsed (kubel--parse-body body))
+                        (hashtable (kubel--parsed-body-to-ns-name-ht parsed)))
+                   (setq res hashtable)))
+                ((eq type 'top)
+                 (let* ((kubel-list-wide nil)
+                        (body (kubel--exec-to-string (concat (kubel--kubectl-prefix kubel-namespace)
+                                                             " top " kubel-resource-type (kubel--kubectl-suffix))))
+                        (parsed (kubel--parse-body body))
+                        (hashtable (kubel--parsed-body-to-ns-name-ht parsed)))
+                   (dolist (ns-name (ht-keys hashtable))
+                     (when (ht-contains? res ns-name)
+                       (ht-set res ns-name (ht-merge (ht-get res ns-name) (ht-get hashtable ns-name)))))))
+                ((eq type 'custom)
+                 (let* ((kubel-list-wide nil)
+                        (spec (asoc-get call 'spec))
+                        (body (kubel--exec-to-string (concat (kubel--kubectl-prefix kubel-namespace)
+                                                             " get " kubel-resource-type
+                                                             " -o custom-columns=" spec
+                                                             (kubel--kubectl-suffix))))
+                        (parsed (kubel--parse-body body))
+                        (hashtable (kubel--parsed-body-to-ns-name-ht parsed)))
+                   (dolist (ns-name (ht-keys hashtable))
+                     ;; if resource appeared between the calls
+                     ;; TODO: generalize this bit
+                     (when (ht-contains? res ns-name)
+                       (ht-set res ns-name (ht-merge (ht-get res ns-name) (ht-get hashtable ns-name)))))))
+                ((eq type 'jsonpath)
+                 (let* ((kubel-list-wide nil)
+                        (spec (asoc-get call 'spec))
+                        (columns (asoc-get call 'columns))
+                        (body (kubel--exec-to-string (concat (kubel--kubectl-prefix kubel-namespace)
+                                                             " get " kubel-resource-type
+                                                             " -o jsonpath=" spec
+                                                             (kubel--kubectl-suffix))))
+                        (parsed (kubel--parse-jsonpath-body body columns))
+                        (hashtable (kubel--parsed-body-to-ns-name-ht parsed)))
+                   (dolist (ns-name (ht-keys hashtable))
+                     (when (ht-contains? res ns-name)
+                       (ht-set res ns-name (ht-merge (ht-get res ns-name) (ht-get hashtable ns-name)))))))
+                ((eq type 'jsonpath-repeated-columns)
+                 (let* ((kubel-list-wide nil)
+                        (spec (asoc-get call 'spec))
+                        (static-columns (asoc-get call 'static-columns))
+                        (repeated-columns (asoc-get call 'repeated-columns))
+                        (body (kubel--exec-to-string (concat (kubel--kubectl-prefix kubel-namespace)
+                                                             " get " kubel-resource-type
+                                                             " -o jsonpath=" spec
+                                                             (kubel--kubectl-suffix))))
+                        (pre-process-alist (asoc-get call 'pre-process))
+                        (post-process-alist (asoc-get call 'post-process))
+                        (parsed (kubel--parse-jsonpath-repeated-columns-body
+                                 body static-columns repeated-columns pre-process-alist post-process-alist))
+                        (hashtable (kubel--parsed-body-to-ns-name-ht parsed)))
+                   (dolist (ns-name (ht-keys hashtable))
+                     (when (ht-contains? res ns-name)
+                       (ht-set res ns-name (ht-merge (ht-get res ns-name) (ht-get hashtable ns-name))))))))))
+      (append
+       (list table-columns)
+       (mapcar
+        (lambda (entry-ht)
+          (dolist (fn post-process-fns)
+           (funcall fn entry-ht))
+          (mapcar
+           (lambda (column) (ht-get entry-ht column))
+           table-columns))
+        (ht-values res))))))
+
+(comment
+ (let ((kubel-resource-type "pods")
+       (kubel-context "minikube")
+       (kubel-namespace "default"))
+   (kubel--make-view-calls))
+
+ (let ((kubel-resource-type "pods")
+       (kubel-context "minikube")
+       (kubel-namespace "*ALL*"))
+   (kubel--parse-body (kubel--exec-to-string (concat (kubel--kubectl-prefix kubel-namespace)
+                                                     " top " kubel-resource-type (kubel--kubectl-suffix)))))
+ (let ((kubel-resource-type "pods")
+       (kubel-context "minikube")
+       (kubel-namespace "default"))
+   (kubel--parse-jsonpath-body (kubel--exec-to-string (concat (kubel--kubectl-prefix kubel-namespace)
+                                                              " get " kubel-resource-type
+                                                              " -o jsonpath='{range .items[*]}{.metadata.namespace} {.metadata.name} {..resources.requests.cpu}{\"\\n\"}{end}'"
+                                                              (kubel--kubectl-suffix)))
+                               '("NAMESPACE" "NAME" "CPUREQ")))
+ (let ((kubel-resource-type "pods")
+       (kubel-context "minikube")
+       (kubel-namespace "default"))
+   (kubel--parse-jsonpath-repeated-columns-body
+    (kubel--exec-to-string (concat (kubel--kubectl-prefix kubel-namespace)
+                                   " get " kubel-resource-type
+                                   " -o jsonpath='{range .items[*]}{.metadata.namespace} {.metadata.name}{range .spec.containers[*]} {.resources.requests.cpu} {.resources.requests.memory} {.resources.limits.cpu} {.resources.limits.memory}{end}{\"\\n\"}{end}'"
+                                   (kubel--kubectl-suffix)))
+    '("NAMESPACE" "NAME")
+    '("CPUREQ" "MEMREQ" "CPULIM" "MEMLIM")
+    `(("CPUREQ" . ,(lambda (acc arg)
+                           (let ((number (kubel--convert-cpu-units-millis arg)))
+                             (+ acc number))))
+      ("MEMREQ" . ,(lambda (acc arg)
+                     (let ((number (kubel--convert-size-units-bytes arg)))
+                       (+ acc number))))
+      ("CPULIM" . ,(lambda (acc arg)
+                    (let ((number (kubel--convert-cpu-units-millis arg)))
+                      (+ acc number))))
+      ("MEMLIM" . ,(lambda (acc arg)
+                     (let ((number (kubel--convert-size-units-bytes arg)))
+                       (+ acc number)))))
+    `(("CPUREQ" . ,(lambda (arg)
+                           (kubel--convert-cpu-units-str arg)))
+      ("MEMREQ" . ,(lambda (arg)
+                     (kubel--convert-size-units-str arg)))
+      ("CPULIM" . ,(lambda (arg)
+                     (kubel--convert-cpu-units-str arg)))
+      ("MEMLIM" . ,(lambda (arg)
+                     (kubel--convert-size-units-str arg)))))))
+
+
+(defvar kubel--size-units-alist '(("Ki" . Ki)
+                                  ("Mi" . Mi)
+                                  ("Gi" . Gi)
+                                  ("Ti" . Ti)
+                                  ("" . B)))
+
+(defvar kubel--size-unit-multipliers-alist `((Ti . ,(* 1024 1024 1024 1024))
+                                             (Gi . ,(* 1024 1024 1024))
+                                             (Mi . ,(* 1024 1024))
+                                             (Ki . 1024)
+                                             (B . 1)))
+
+(defun kubel--appropriate-mult (bytes mults)
+  "A function returning an appropriate size multiplier cons cell for given
+amount of bytes.
+
+BYTES is the number of bytes
+MULTS is an alist of multipliers"
+
+  (if (= bytes 0) (cons 'B 1)
+    (let* ((current (car mults))
+           (name (car current))
+           (mult (cdr current))
+           (rest (cdr mults)))
+      (if (> bytes mult)
+          (cons name mult)
+        (kubel--appropriate-mult bytes rest)))))
+
+(defun kubel--convert-size-units-bytes (s)
+  "Convert a string representing size to bytes integer.
+
+S is the string."
+  (if (or (s-equals? "-" s) (s-blank? s))
+      0
+    (when (string-match (rx bol (group (one-or-more digit)) (group (? (or "Ki" "Mi" "Gi" "Ti")) eol))
+                        s)
+      (let* ((num (string-to-number (match-string 1 s)))
+             (units (asoc-get kubel--size-units-alist (match-string 2 s)))
+             (multiplier (asoc-get kubel--size-unit-multipliers-alist units))
+             (bytes (* num multiplier)))
+        bytes))))
+
+(defun kubel--convert-size-units-str (bytes)
+  "Convert bytes into a string with an appropriate multiplier."
+  (if (null bytes)
+      ""
+    (let* ((appropriate-name-mult (kubel--appropriate-mult bytes kubel--size-unit-multipliers-alist))
+           (appropriate-name (car appropriate-name-mult))
+           (appropriate-mult (cdr appropriate-name-mult))
+           (scaled (/ bytes appropriate-mult)))
+      (substring-no-properties (format "%.0f%s" scaled appropriate-name)))))
+
+(defun kubel--convert-cpu-units-millis (s)
+  "Convert a string representing CPU usage into millicores.
+
+S is the string."
+  (if (or (s-equals? "-" s) (s-blank? s))
+      0
+    (if (s-suffix? "m" s)
+        (string-to-number (s-chop-suffix "m" s))
+      (* 1000 (string-to-number s)))))
+
+(defun kubel--convert-cpu-units-str (millis)
+  "Convert millis into a CPU usage string.
+
+MILLIS is the amount of millicores."
+  (if (null millis)
+      ""
+    (if (> millis 1000)
+        (format "%.1f" (/ millis 1000))
+      (concat (number-to-string millis) "m"))))
+
+(defun kubel--ratio (x y)
+  "Calculate a usage ratio X/Y in percents, return as a string.
+
+If either is null, or y == 0, return \"N/A\""
+  (if (or (null y) (zerop y) (null x))
+      "N/A"
+    (substring-no-properties (format "%.0f%%" (/ x y 0.01)))))
+
+(defun kubel--populate-list (&optional no-refresh)
+  "Return a list with a tabulated list format and \"tabulated-list-entries\".
+
+NO-REFRESH inhibits running kubectl."
+  (let*  ((parsed-body (unless no-refresh
+                         (kubel--make-view-calls)))
+          (entrylist (if no-refresh
+                         kubel--entrylist-cache
+                       parsed-body)))
+    (setq kubel--entrylist-cache entrylist)
+    (kubel--populate-view-entries entrylist)
+    ;; (when (string-prefix-p "No resources found" body)
+    ;;   (message "No resources found"))  ;; TODO exception here
+    (let ((list-format (kubel--get-list-format entrylist))
+          (list-entries (kubel--get-list-entries)))
+      (list list-format list-entries))))
 
 (defun kubel--age-to-secs (age)
   "Convert AGE in format 1d2h3m4s to seconds."
@@ -376,15 +968,36 @@ CMD is the command string to run."
       (< (kubel--age-to-secs age1)
          (kubel--age-to-secs age2)))))
 
+(defun kubel--make-resource-usage-comparator (colnum)
+  "Return a function that compares two resource usages at given column COLNUM."
+  (lambda (row1 row2)
+    (let* ((usage1 (elt (cadr row1) colnum))
+           (usage2 (elt (cadr row2) colnum))
+           (parsed1 (kubel--get-percentage usage1))
+           (parsed2 (kubel--get-percentage usage2))
+           (perc1 (car parsed1))
+           (perc2 (car parsed2)))
+      (cond ((null perc1)
+             t)
+            ((null perc2)
+             nil)
+            (t
+             (< perc1
+              perc2))))))
+
 (defun kubel--column-entry (entrylist)
-  "Return a function of colnum to retrieve an entry in a given column for ENTRYLIST."
+  "Return a function of colnum to retrieve an entry in a given column for
+ENTRYLIST."
   (function
    (lambda (colnum)
      (let* ((name (kubel--column-header entrylist colnum))
             (width (+ 4 (kubel--column-width entrylist colnum)))
-            (sort (if (member name '("AGE" "DURATION" "LAST SCHEDULE"))
-                      (kubel--make-age-comparator colnum)
-                    t)))
+            (sort (cond
+                   ((or (s-prefix? "CPU" name) (s-prefix? "MEM" name))
+                    (kubel--make-resource-usage-comparator colnum))
+                   ((member name '("AGE" "DURATION" "LAST SCHEDULE"))
+                    (kubel--make-age-comparator colnum))
+                   (t t))))
        (list name width sort)))))
 
 (defun kubel--get-list-format (entrylist)
@@ -396,23 +1009,29 @@ ENTRYLIST is the output of the parsed body."
       (funcall kubel--get-entry colnum)))
   (cl-map 'vector #'kubel--get-column-entry (number-sequence 0 (- (kubel--ncols entrylist) 1))))
 
-(defun kubel--update-selected-items (entries)
-  "Check that all selected items still exist.
+;; TODO: is this the correct behaviour? should we instead build intersection between
+;; visible and selected items for the operations that work on selections?
+(defun kubel--update-selected-items ()
+  "Check that all selected items still exist."
+  (dolist (ns-name (ht-keys kubel--selected-items-set))
+    (unless (and (ht-contains? kubel--ns-name->columns-alist ns-name)
+                 (ht-get kubel--ns-name->visible ns-name))
+      (ht-remove kubel--selected-items-set ns-name))))
 
-ENTRIES are all resources."
-  (dolist (i (-difference kubel--selected-items (mapcar #'car entries)))
-    (setq kubel--selected-items (delete i kubel--selected-items))))
-
-(defun kubel--get-list-entries (entrylist)
+(defun kubel--get-list-entries ()
   "Get the entries.
 
 ENTRYLIST is the output of the parsed body."
-  (let ((entries (cdr entrylist)))
-    (kubel--update-selected-items entries)
-    (mapcar (lambda (x)
-              (list (car x)
-                    (vconcat [] (mapcar #'kubel--propertize-status x))))
-            entries)))
+  (let ((entries (mapcar (lambda (item)
+                          (let ((name (asoc-get item "NAME"))
+                                (ns (kubel--ns item)))
+                            (list (format "%s/%s" ns name)
+                                  (vconcat [] (mapcar #'cdr (kubel--propertize-item (cons ns name) item))))))
+                         (reverse (ht-values kubel--ns-name->columns-alist)))))
+    (cl-remove-if
+     (lambda (entry)
+       (kubel--empty? (cadr entry)))
+     entries)))
 
 (defun kubel--parse-body (body)
   "Parse the body of kubectl get resource call into a list.
@@ -430,6 +1049,67 @@ BODY is the raw output of kubectl get resource."
                                  (kubel--extract-value line (car pos) (cdr pos)))
                                position))))
     (mapcar parse-line lines)))
+
+(defun kubel--parse-jsonpath-body (body columns)
+  "Parse the body of kubectl get resource call into a list.
+
+BODY is the raw output of kubectl get resource."
+  (let* ((lines (or (nbutlast (split-string body "\n")) '(""))))
+    (append
+     (list columns)
+     (mapcar
+      (lambda (line)
+        (split-string line " "))
+      lines))))
+
+(defun kubel--parse-jsonpath-repeated-columns-body (body static-columns repeated-columns pre-process-alist post-process-alist)
+  "Parse the body of kubectl get resource call into a list.
+
+BODY is the raw output of kubectl get resource."
+  (let* ((lines (or (nbutlast (split-string body "\n")) '("")))
+         (longest-line-columns 0)
+         (contents (mapcar
+                    (lambda (line)
+                      (let ((splat (split-string line " ")))
+                        (when (< longest-line-columns (length splat))
+                            (setq longest-line-columns (length splat)))
+                        splat))
+                    lines))
+         (number-of-repeats (truncate (/ (- longest-line-columns (length static-columns))
+                                         (length repeated-columns))))
+         (dynamic-columns '())
+         (columns static-columns))
+    ;; FIXME: this is likely ineffective, refactor
+    (dotimes (i number-of-repeats)
+      (setq dynamic-columns (append dynamic-columns repeated-columns)))
+    (let* ((all-columns (append columns repeated-columns))
+           (dynamic-columns-vector (vconcat dynamic-columns))
+           (aggregated-contents (mapcar
+                                 (lambda (line-list)
+                                   (let ((repeated-fields (ht)) ;; aggregate every repeated field in ht
+                                         (static-content (take (length static-columns) line-list))
+                                         (repeated-content (drop (length static-columns) line-list))
+                                         (dynamic-columns-length (length dynamic-columns-vector)))
+                                     (dotimes (i (length repeated-content))
+                                       (let ((current-repeated-field (aref dynamic-columns-vector (mod i dynamic-columns-length))))
+                                         (ht-set repeated-fields current-repeated-field
+                                                 (funcall (asoc-get pre-process-alist current-repeated-field)
+                                                          (ht-get repeated-fields current-repeated-field 0)
+                                                          (nth i repeated-content)))))
+                                     ;; read contents back from hashtable
+                                     (append static-content (mapcar
+                                                             (lambda (column)
+                                                               (funcall (asoc-get post-process-alist column)
+                                                                        (ht-get repeated-fields column)))
+                                                             repeated-columns))))
+                                 contents)))
+      (append
+       (list all-columns)
+       aggregated-contents))))
+
+(comment
+ (append '(1 2 3) '(4 5)))
+
 
 (defun kubel--extract-value (line min max)
   "Extract value from LINE between MIN and MAX.
@@ -463,25 +1143,94 @@ If MAX is the end of the line, dynamically adjust."
 
 (defun kubel--buffer-name ()
   "Return kubel buffer name."
-  (concat (kubel--buffer-name-from-parameters kubel-context kubel-namespace kubel-resource)
-          (unless (equal kubel-selector "")
-            (format " (%s)" kubel-selector))))
+  (concat
+   (kubel--buffer-name-from-parameters kubel-context kubel-namespace kubel-resource-type)
+   ;; TODO: maybe extract this into a function
+   (unless (and (kubel--empty? kubel-selectors) (s-blank? kubel-field-selectors))
+     (concat
+      " ("
+      (mapconcat #'identity (append kubel-selectors
+                                    (unless (s-blank? kubel-field-selectors)
+                                      (list kubel-field-selectors)))
+                 " ")
+      ")"))))
 
-(defun kubel--items-selected-p ()
+
+;; (defun kubel--get-percentage (s)
+;;   (when (string-match (rx bol (group (* anything) "(")  (group (one-or-more digit)) (group "%)") eol) s)
+;;     (list
+;;      (match-string 1 s)
+;;      (string-to-number (match-string 2 s))
+;;      (match-string 3 s))))
+
+(defun kubel--get-percentage (s)
+  (when (string-match (rx bol (group (one-or-more digit)) (group "% (" (* anything) ")") eol) s)
+    (list
+     (string-to-number (match-string 1 s))
+     (match-string 2 s))))
+
+(comment
+ (kubel--get-percentage "0% (-/2.0)"))
+
+(defun kubel--items-selected? ()
   "Return non-nil if there are items selected."
-  (>= (length kubel--selected-items) 1))
+  (not (ht-empty? kubel--selected-items-set)))
 
-(defun kubel--propertize-status (status)
-  "Return the status in proper font color.
+(defun kubel--propertize-item (ns-name item)
+  "Return the propertized item fields.
 
-STATUS is the pod status string."
-  (let ((status-face (cdr (assoc status kubel-status-faces)))
-        (match (or (equal kubel-resource-filter "") (string-match-p kubel-resource-filter status)))
-        (selected (and (kubel--items-selected-p) (-contains? kubel--selected-items status))))
-    (cond (status-face (propertize status 'face status-face))
-          (selected (propertize (concat "*" status) 'face 'dired-marked))
-          ((not match) (propertize status 'face 'shadow))
-          (t status))))
+ITEM is the item hash-table."
+  (let ((item-propertized (asoc-make))
+        (name (cdr ns-name))
+        (matched? nil)
+        ;; always search case-insensitively
+        (case-fold-search t))
+    (asoc-map
+     (lambda (key value)
+       (let ((match (or (equal kubel-resource-filter "") (string-match-p kubel-resource-filter value))))
+         (if match (setq matched? t))
+         (cond
+          ((string-equal key "STATUS")
+           (if (and (not match) (not kubel-filter-hides))
+               (asoc-put! item-propertized key (propertize value 'face 'shadow))
+             (let ((status-face (cdr (assoc value kubel-status-faces))))
+              (asoc-put! item-propertized key (propertize value 'face status-face)))))
+          ((string-equal key "NAME")
+           (if (ht-contains? kubel--selected-items-set ns-name)
+               ;; if selected
+               (asoc-put! item-propertized key (propertize (concat "*" name) 'face 'dired-marked))
+             (if (and (not match) (not kubel-filter-hides))
+                 (asoc-put! item-propertized key (propertize value 'face 'shadow))
+               (asoc-put! item-propertized key value))))
+          ((or (s-prefix? "CPU" key) (s-prefix? "MEM" key))
+           (if (and (not match) (not kubel-filter-hides))
+               (asoc-put! item-propertized key (propertize value 'face 'shadow))
+             (let* ((parsed (kubel--get-percentage value))
+                    (percentage (car parsed))
+                    (rest (cadr parsed)))
+               (cond ((null percentage) ; no match
+                      (asoc-put! item-propertized key value))
+                     ((>= percentage kubel-percentage-critical-threshold)
+                      (asoc-put! item-propertized key
+                                 (concat
+                                  (propertize (number-to-string percentage) 'face 'kubel-percentage-critical-face)
+                                  rest)))
+                     ((>= percentage kubel-percentage-warning-threshold)
+                      (asoc-put! item-propertized key
+                                 (concat
+                                  (propertize (number-to-string percentage) 'face 'kubel-percentage-warning-face)
+                                  rest)))
+                     (t (asoc-put! item-propertized key value))))))
+          ((and (not match) (not kubel-filter-hides))
+           (asoc-put! item-propertized key (propertize value 'face 'shadow)))
+          (t (asoc-put! item-propertized key value)))))
+     item)
+    (if (and kubel-filter-hides (not matched?))
+        (progn
+          (ht-set kubel--ns-name->visible ns-name nil)
+          nil)
+      (ht-set kubel--ns-name->visible ns-name t)
+      (reverse item-propertized))))
 
 (defun kubel--pop-to-buffer (name)
   "Utility function to pop to buffer or create it.
@@ -491,9 +1240,10 @@ NAME is the buffer name."
     (get-buffer-create name))
   (pop-to-buffer-same-window name))
 
-(defun kubel--process-error-buffer (process-name)
+;; TODO: left it as a function call for now but maybe get rid of it later
+(defun kubel--process-error-buffer ()
   "Return the error buffer name for the PROCESS-NAME."
-  (format "*%s:err*" process-name))
+  kubel--output-buffer-name)
 
 (defun kubel--sentinel (callback)
   "Sentinel function used by KUBEL--EXEC.
@@ -506,64 +1256,146 @@ CALLBACK is called when process completes successfully.
       (kubel--append-to-process-buffer (format "[%s]\nexit-code: %s" process-name exit-status))
       (if (eq 0 exit-status)
           (when callback (funcall callback))
-        (let ((err (with-current-buffer (kubel--process-error-buffer process-name)
+        (let ((err (with-current-buffer (kubel--process-error-buffer)
                      (buffer-string))))
           (kubel--append-to-process-buffer (format "error: %s" err))
           (error (format "Kubel process %s error: %s" process-name err)))))))
 
-(defun kubel--exec (process-name args &optional readonly callback)
+(defun kubel--exec (process-name ns op-type args &optional readonly callback)
   "Utility function to run commands in the proper context and namespace.
 
 PROCESS-NAME is an identifier for the process.  Default to \"kubel-command\".
-ARGS is a ist of arguments.
+NS is namespace in which the operation should be performed. nil means no namespace.
+OP-TYPE is a type of operation being performed.
+ARGS is a list of arguments.
 CALLBACK is a function that will be executed when the command completes.
 READONLY If true buffer will be in readonly mode(view-mode)."
   (when (equal process-name "")
     (setq process-name "kubel-command"))
-  (let ((buffer-name (format "*kubel-resource:%s:%s:%s*" kubel-context kubel-namespace (string-join args "_")))
-        (error-buffer (kubel--process-error-buffer process-name))
-        (cmd (append (list kubel-kubectl) (kubel--get-context-namespace) args)))
-    (when (get-buffer buffer-name)
+
+  (let* ((buffer-action (if (asoc-contains-key? kubel--op->buffer-action op-type)
+                            (asoc-get kubel--op->buffer-action op-type)
+                          'pop))
+         (buffer-name (cond ((eq buffer-action 'accumulate)
+                             kubel--output-buffer-name)
+                            (t
+                             (format "*kubel-resource:%s:%s:%s*" kubel-context ns (string-join args "_")))))
+         (error-buffer (kubel--process-error-buffer))
+         (cmd (append (list kubel-kubectl) (kubel--get-context-kubectl-arg) (kubel--get-ns-kubectl-arg ns) args)))
+    (when (and (get-buffer buffer-name)
+               (not (eq buffer-action 'accumulate)))
       (kill-buffer buffer-name))
-    (when (get-buffer error-buffer)
-      (kill-buffer error-buffer))
+
     (kubel--log-command process-name cmd)
     (make-process :name process-name
                   :buffer buffer-name
                   :sentinel (kubel--sentinel callback)
                   :file-handler t
-                  :stderr (get-buffer-create error-buffer)
+                  ;; :stderr (get-buffer-create error-buffer)
+                  :stderr nil
                   :command cmd)
-    (pop-to-buffer buffer-name)
+    (cond ((eq buffer-action 'pop)
+           (pop-to-buffer buffer-name))
+          ((eq buffer-action 'pop-comint)
+           (pop-to-buffer buffer-name)
+           (with-current-buffer buffer-name
+             (comint-mode)))
+          ((eq buffer-action 'accumulate)
+           ;; TODO: this is incorrect, but we'll figure it out
+           (display-buffer buffer-name
+                           '((display-buffer-reuse-window)
+                             (inhibit-same-window . t))
+                           t))
+          (t (pop-to-buffer buffer-name)))
     (if readonly
         (with-current-buffer buffer-name
           (view-mode)))))
 
-(defun kubel--get-resource-under-cursor ()
+(defun kubel--get-ns-under-cursor ()
+  "Utility function to get the namespace of the resource under the cursor."
+  (cond
+   ((kubel--resource-type-global? kubel-resource-type) nil)
+   (kubel--all-namespaces-view (aref (tabulated-list-get-entry) 0))
+   (t kubel-namespace)))
+
+(defun kubel--empty? (seq)
+  (zerop (length seq)))
+
+(defun kubel--get-name-under-cursor ()
   "Utility function to get the name of the resource under the cursor.
 Strip the `*` prefix if the resource is selected"
-  (string-remove-suffix " (default)" ;; see https://github.com/abrochard/kubel/issues/106
-                        (replace-regexp-in-string
-                         "^\*" "" (aref (tabulated-list-get-entry) 0))))
+  (if (kubel--empty? (tabulated-list-get-entry))
+      (error "No item selected")
+    (string-remove-suffix " (default)" ;; see https://github.com/abrochard/kubel/issues/106
+                          (replace-regexp-in-string
+                           "^\*" "" (aref (tabulated-list-get-entry)
+                                          (if kubel--all-namespaces-view 1 0))))))
 
-(defun kubel--get-context-namespace ()
-  "Utility function to return the proper context and namespace arguments."
+(defun kubel--get-ns-name-under-cursor ()
+  "Utility function to get the resource under the cursor."
+  (let ((name (kubel--get-name-under-cursor))
+        (ns (kubel--get-ns-under-cursor)))
+    (cons ns name)))
+
+(defun kubel--all-namespaces? ()
+  "Utility function to return if currently in special all-namespaces namespace."
+  (equal kubel-namespace kubel--all-namespaces-entry))
+
+(defun kubel--get-context-kubectl-arg ()
+  "Utility function to return the proper context argument."
   (append
    (unless (equal kubel-context "")
-     (list "--context" kubel-context))
-   (unless (equal kubel-namespace "")
-     (list "-n" kubel-namespace))))
+     (list "--context" kubel-context))))
 
-(defun kubel--get-selector ()
+(defun kubel--get-ns-kubectl-arg (ns)
+  "Utility function to return the proper namespace arguments."
+  (append
+   (unless (or (equal ns kubel--all-namespaces-entry)
+               ;; ns is nil for global (i.e. non-namespaced) objects
+               (null ns)
+               ;; FIXME: is ns ever ""?
+               (equal ns ""))
+     (list "-n" ns))))
+
+(defun kubel--get-selectors ()
   "Utility function to return current label selector."
-  (unless (equal kubel-selector "")
-    (list "--selector" kubel-selector)))
+  (unless (kubel--empty? kubel-selectors)
+    (let ((result '()))
+      (reverse
+       (dolist (selector kubel-selectors result)
+         (push "--selector" result)
+         (push selector result))))))
 
-(defun kubel--get-command-prefix ()
-  "Utility function to prefix the kubectl command with proper context and namespace."
-  (mapconcat 'identity (append (list kubel-kubectl) (kubel--get-context-namespace) (kubel--get-selector)) " "))
+(defun kubel--kubectl-prefix (ns)
+  "Utility function to prefix the kubectl command with proper context and
+namespace."
+  (mapconcat 'identity (append (list kubel-kubectl) (kubel--get-context-kubectl-arg) (kubel--get-ns-kubectl-arg ns) (kubel--get-selectors)) " "))
 
-(defun kubel--get-containers (pod-name &optional type)
+;; TODO merge these?
+(defun kubel--kubectl-suffix ()
+  "Utility function to suffix the kubectl get command with flags."
+  (mapconcat 'identity (append '(" ")
+                               (if (kubel--all-namespaces?) (list "--all-namespaces"))
+                               (if kubel-list-wide (list "-o wide"))
+                               (if (not (s-blank? kubel-field-selectors)) (list "--field-selector" kubel-field-selectors)))
+             " "))
+
+(comment
+ (let ((kubel-field-selectors "foo==bar"))
+   (kubel--kubectl-suffix)))
+
+(defun kubel--kubectl-suffix-all-namespaces ()
+  "Utility function to suffix the kubectl get command with all namespaces flag."
+  (if (kubel--all-namespaces?)
+      " --all-namespaces"
+    " "))
+
+(defun kubel--kubectl-suffix-all-namespaces-suffix-by-ns (ns)
+  (if (equal ns kubel--all-namespaces-entry)
+      " --all-namespaces"
+    ""))
+
+(defun kubel--get-containers (ns pod-name &optional type)
   "List the containers in a pod.
 
 POD-NAME is the name of the pod.
@@ -571,9 +1403,9 @@ TYPE is containers or initContainers."
   (unless type (setq type "containers"))
   (split-string
    (kubel--exec-to-string
-    (format "%s get pod %s -o jsonpath='{.spec.%s[*].name}'" (kubel--get-command-prefix) pod-name type)) " "))
+    (format "%s get pod %s -o jsonpath='{.spec.%s[*].name}'" (kubel--kubectl-prefix ns) pod-name type)) " "))
 
-(defun kubel--get-pod-labels ()
+(defun kubel--get-pod-labels (ns)
   "List labels of pods in a current namespace."
   (let* ((raw-labels
           (split-string
@@ -582,7 +1414,9 @@ TYPE is containers or initContainers."
             (replace-regexp-in-string
              "map\\[\\(.+?\\)\\]" "\\1"
              (kubel--exec-to-string
-              (format "%s get pod -o jsonpath='{.items[*].metadata.labels}'" (kubel--get-command-prefix)))))))
+              (format "%s get pod -o jsonpath='{.items[*].metadata.labels}' %s"
+                      (kubel--kubectl-prefix ns)
+                      (kubel--kubectl-suffix-all-namespaces-suffix-by-ns ns)))))))
          (splitted (mapcan (lambda (s) (split-string s ","))
                            raw-labels))
          (cleaned (mapcar (lambda (s) (replace-regexp-in-string "[{|\"|}]" "" s)) splitted))
@@ -593,75 +1427,96 @@ TYPE is containers or initContainers."
   "Prompt user to select an instance out of a list of resources.
 
 NAME is the string name of the resource."
-  (let ((cmd (format "%s get %s -o=jsonpath='{.items[*].metadata.name}'"
-                     (kubel--get-command-prefix) name)))
-    (completing-read (concat (s-upper-camel-case name) ": ")
-                     (split-string (kubel--exec-to-string cmd) " "))))
+  (let ((cmd
+         (if (kubel--all-namespaces?)
+             (format "%s get %s -o=jsonpath='{range .items[*]}{.metadata.namespace}{\"/\"}{.metadata.name}{\" \"}{end}' %s"
+                     (kubel--kubectl-prefix nil) name (kubel--kubectl-suffix-all-namespaces))
+           (format "%s get %s -o=jsonpath='{.items[*].metadata.name}'"
+                   (kubel--kubectl-prefix kubel-namespace) name))))
+    (kubel--ns/name-to-ns-name
+     (completing-read (concat (s-upper-camel-case name) ": ")
+                      (split-string (kubel--exec-to-string cmd) " ")))))
 
-(defun kubel--describe-resource (name &optional describe)
+(defun kubel--ns/name-to-ns-name (ns/name)
+  "Utility function to parse selected ns/name into (ns . name) cons cell.
+
+NS/NAME is the string representing the object name, of the format
+NAMESPACE/NAME."
+  (if (kubel--all-namespaces?)
+      (let ((parts (split-string ns/name "/")))
+        (cons (car parts) (cadr parts)))
+    (cons kubel-namespace ns/name)))
+
+(defun kubel--describe-object (resource-type &optional describe)
   "Describe a specific resource.
 
-NAME is the string name of the resource to decribe.
+RESOURCE-TYPE is the string name of the resource type to decribe.
 DESCRIBE is boolean to describe instead of get resource details"
-  (let* ((resource (kubel--select-resource name))
-         (process-name (format "kubel - %s - %s" name resource))
+  (let* ((ns-name (kubel--select-resource resource-type))
+         (ns (car ns-name))
+         (name (cdr ns-name))
+         (process-name (format "kubel - %s - %s/%s" resource-type ns name))
          (callback (lambda ()
                      (set-buffer-modified-p nil)
                      (goto-char (point-min)))))
     (if describe
-        (kubel--exec process-name (list "describe" name resource) nil callback)
-      (kubel--exec process-name (list "get" name "-o" kubel-output resource) nil callback))
+        (kubel--exec process-name ns 'describe (list "describe" resource-type name) nil callback)
+      (kubel--exec process-name ns 'get (list "get" resource-type "-o" kubel-output name) nil callback))
     (when (string-equal kubel-output "yaml")
       (kubel-yaml-editing-mode))))
 
-(defun kubel--show-rollout-revision (type name)
+(defun kubel--show-rollout-revision (type ns name)
   "Show a specific revision of a certain resource.
 
 TYPE is the resource type.
 NAME is the resource name."
+  (message "resource: %s/%s" ns name)
   (let* ((typename (format "%s/%s" type name))
-         (revision (car (split-string (kubel--select-rollout typename))))
+         (revision (car (split-string (kubel--select-rollout typename ns))))
          (process-name (format "kubel - rollout - %s - %s" typename revision))
-         (callback (goto-char (point-min))))
-    (kubel--exec process-name
+         (callback (lambda () (goto-char (point-min)))))
+    (kubel--exec process-name ns 'rollout-history
                  (list "rollout" "history" typename (format "--revision=%s" revision)) nil callback)))
 
-(defun kubel--list-rollout (typename)
+;; TODO: fix this
+(defun kubel--list-rollout (typename ns)
   "Return a list of revisions with format '%number   %cause'.
 
 TYPENAME is the resource type/name."
-  (let ((cmd (format "%s rollout history %s" (kubel--get-command-prefix) typename)))
+
+  (let ((cmd (format "%s rollout history %s" (kubel--kubectl-prefix ns) typename)))
     (nthcdr 2 (split-string (kubel--exec-to-string cmd) "\n" t))))
 
-(defun kubel--select-rollout (typename)
+(defun kubel--select-rollout (typename ns)
   "Select a rollout version.
 
 TYPENAME is the resource type/name."
   (let ((prompt (format "Select a rollout of %s: " typename))
-        (rollouts (kubel--list-rollout typename)))
+        (rollouts (kubel--list-rollout typename ns)))
     (completing-read prompt rollouts)))
 
 (defun kubel--is-pod-view ()
   "Return non-nil if this is the pod view."
-  (equal (capitalize kubel-resource) "Pods"))
+  (equal (capitalize kubel-resource-type) "Pods"))
 
 (defun kubel--is-deployment-view ()
   "Return non-nil if this is a deployment view."
-  (-contains? '("Deployments" "deployments" "deployments.apps") kubel-resource))
+  (-contains? '("Deployments" "deployments" "deployments.apps") kubel-resource-type))
 
+;; TODO: generalize this somehow?
 (defun kubel--is-scalable ()
   "Return non-nil if the resource can be scaled."
   (or
    (kubel--is-deployment-view)
-   (-contains? '("ReplicaSets" "replicasets" "replicasets.apps") kubel-resource)
-   (-contains? '("StatefulSets" "statefulsets" "statefulsets.apps") kubel-resource)))
+   (-contains? '("ReplicaSets" "replicasets" "replicasets.apps") kubel-resource-type)
+   (-contains? '("StatefulSets" "statefulsets" "statefulsets.apps") kubel-resource-type)))
 
 (defun kubel-kill-buffer ()
   "Kill the current buffer."
   (interactive)
   (when (or (not (buffer-modified-p))
-	    (not kubel-kill-buffer-query)
-	    (yes-or-no-p "Resource modified; kill anyway? "))
+            (not kubel-kill-buffer-query)
+            (yes-or-no-p "Resource modified; kill anyway? "))
     (kill-buffer (current-buffer))))
 
 (defvar kubel-yaml-editing-mode-map
@@ -670,6 +1525,13 @@ TYPENAME is the resource type/name."
     (define-key map (kbd "C-c C-k") #'kubel-kill-buffer)
     map)
   "Keymap used in `kubel-yaml-editing-mode' buffers.")
+
+(defvar kubel-json-editing-mode-map
+  (let ((map (make-sparse-keymap)))
+    (define-key map (kbd "C-c C-c") #'kubel-apply)
+    (define-key map (kbd "C-c C-k") #'kubel-kill-buffer)
+    map)
+  "Keymap used in `kubel-json-editing-mode' buffers.")
 
 ;; interactive
 ;;;###autoload
@@ -680,6 +1542,13 @@ Allows simple apply of the changes made.
 
 \\{kubel-yaml-editing-mode-map}")
 
+(define-derived-mode kubel-json-editing-mode json-mode "kubel/e"
+  "Kubel JSON editing mode.
+
+Allows simple apply of the changes made.
+
+\\{kubel-json-editing-mode-map}")
+
 (defun kubel-apply ()
   "Save the current buffer to a temp file and try to kubectl apply it."
   (interactive)
@@ -688,38 +1557,48 @@ Allows simple apply of the changes made.
                       (with-parsed-tramp-file-name default-directory nil
                         (format "/%s%s:%s:" (or hop "") method (if user (concat user "@" host) host))))
                     ""))
-  (let* ((filename-without-tramp-prefix (format "/tmp/kubel/%s-%s.yaml"
+
+  (let* ((filename-without-tramp-prefix (format "/tmp/kubel/%s-%s.%s"
                                                 (replace-regexp-in-string "/" "_"
                                                                           (replace-regexp-in-string "\*\\| " "" (buffer-name)))
-                                                (floor (float-time))))
+                                                (floor (float-time))
+                                                (cond ((eq major-mode 'kubel-yaml-editing-mode) "yaml")
+                                                      ((eq major-mode 'kubel-json-editing-mode) "json"))))
          (filename (format "%s%s" dir-prefix filename-without-tramp-prefix)))
     (when (y-or-n-p "Apply the changes? ")
       (unless  (file-exists-p (format "%s/tmp/kubel" dir-prefix))
         (make-directory (format "%s/tmp/kubel" dir-prefix) t))
       (write-region (point-min) (point-max) filename)
-      (kubel--exec (format "kubectl - apply - %s" filename) (list "apply" "-f" filename-without-tramp-prefix) nil (lambda () (message "Applied %s" filename))))))
+      (kubel--exec (format "kubectl - apply - %s" filename) nil 'apply (list "apply" "-f" filename-without-tramp-prefix) nil (lambda () (message "Applied %s" filename))))))
 
-(defun kubel-get-resource-details (&optional describe)
-  "Get the details of the resource under the cursor.
+(defun kubel-get-object-details (&optional describe)
+  "Get the details of the object under the cursor.
 
  DESCRIBE is the optional param to describe instead of get."
   (interactive "P")
-  (let* ((resource (kubel--get-resource-under-cursor))
+  (let* ((cell (kubel--get-ns-name-under-cursor))
+         (ns (car cell))
+         (name (cdr cell))
          (ctx kubel-context)
-         (ns kubel-namespace)
-         (res kubel-resource)
-         (process-name (format "kubel - %s - %s" kubel-resource resource))
+         (res kubel-resource-type)
+         (process-name (format "kubel - %s - %s" kubel-resource-type name))
          (callback (lambda ()
                      (set-buffer-modified-p nil)
                      (goto-char (point-min)))))
     (if describe
-        (kubel--exec process-name (list "describe" kubel-resource (kubel--get-resource-under-cursor)) nil callback)
-      (kubel--exec process-name (list "get" kubel-resource (kubel--get-resource-under-cursor) "-o" kubel-output) nil callback))
-    (when (or (string-equal kubel-output "yaml") (transient-args 'kubel-describe-popup))
-      (kubel-yaml-editing-mode)
+        (kubel--exec process-name ns 'describe (list "describe" kubel-resource-type name) nil callback)
+      (kubel--exec process-name ns 'get (list "get" kubel-resource-type name "-o" kubel-output) nil callback))
+    (when (or (string-equal kubel-output "yaml")
+              (string-equal kubel-output "json")
+              (transient-args 'kubel-describe-popup))
+      (unless describe
+        (cond ((string-equal kubel-output "yaml")
+               (kubel-yaml-editing-mode))
+              ((string-equal kubel-output "json")
+               (kubel-json-editing-mode))))
       (setq kubel-context ctx)
       (setq kubel-namespace ns)
-      (setq kubel-resource res))))
+      (setq kubel-resource-type res))))
 
 (defun kubel--default-tail-arg (args)
   "Ugly function to make sure that there is at least the default tail.
@@ -730,6 +1609,17 @@ ARGS is the arg list from transient."
       args
     (append args (list (concat "--tail=" (format "%s" kubel-log-tail-n))))))
 
+(defun kubel--max-requests-arg (args)
+  "Function to emit --max-log-requests argument if following logs.
+
+ARGS is the arguments list from transient."
+  ;; FIXME: magic argument
+  (when (kubel--follow-logs-mode? args)
+    (list (format "--max-log-requests=%s" kubel-log-max-log-requests))))
+
+(defun kubel--follow-logs-mode? (args)
+  (member "-f" args))
+
 (defun kubel-get-pod-logs (&optional args type)
   "Get the last N logs of the pod under the cursor.
 
@@ -738,18 +1628,20 @@ TYPE is containers or initContainers."
   (interactive
    (list (transient-args 'kubel-log-popup)))
   (dolist (pod (if (kubel--is-pod-view)
-                   (if (kubel--items-selected-p)
-                       kubel--selected-items
-                     (list (kubel--get-resource-under-cursor)))
+                   (if (kubel--items-selected?)
+                       (ht-keys kubel--selected-items-set)
+                     (list (kubel--get-ns-name-under-cursor)))
                  (list (kubel--select-resource "Pods"))))
-    (let* ((type (or type "containers"))
-           (containers (kubel--get-containers pod type))
+    (let* ((ns (car pod))
+           (name (cdr pod))
+           (type (or type "containers"))
+           (containers (kubel--get-containers ns name type))
            (container (if (equal (length containers) 1)
                           (car containers)
                         (completing-read "Select container: " containers)))
-           (process-name (format "kubel - logs - %s - %s" pod container)))
-      (kubel--exec process-name
-                   (append '("logs") (kubel--default-tail-arg args) (list pod container)) t nil))))
+           (process-name (format "kubel - logs - %s/%s - %s" ns name container)))
+      (kubel--exec process-name ns (if (kubel--follow-logs-mode? args) 'logs-follow 'logs)
+                   (append '("logs") (kubel--default-tail-arg args) (list name container)) t nil))))
 
 (defun kubel-get-pod-logs--initContainer (&optional args)
   "Get the last N logs of the pod under the cursor.
@@ -759,39 +1651,46 @@ ARGS is the arguments list from transient."
    (list (transient-args 'kubel-log-popup)))
   (kubel-get-pod-logs args "initContainers"))
 
+;; this command doesn't make sense in the all-namespaces context
 (defun kubel-get-logs-by-labels (&optional args)
   "Get the last N logs of the pods by labels.
 ARGS is the arguments list from transient."
   (interactive
    (list (transient-args 'kubel-log-popup)))
-  (let* ((labels (kubel--get-pod-labels))
-         (label (completing-read "Select container: " labels))
+  (kubel--max-requests-arg args)
+  (let* ((ns-name (kubel--get-ns-name-under-cursor))
+         (ns (car ns-name))
+         (labels (kubel--get-pod-labels ns))
+         (label (completing-read "Select label: " labels))
          (process-name (format "kubel - logs - %s" label)))
-    (kubel--exec process-name
-                 (append '("logs") (kubel--default-tail-arg args) '("-l") (list label)) t nil)))
+    (kubel--exec process-name ns (if (kubel--follow-logs-mode? args) 'logs-follow 'logs)
+                 (append '("logs") (kubel--default-tail-arg args) (kubel--max-requests-arg args) '("-l") (list label)) t nil)))
 
 (defun kubel-copy-resource-name ()
   "Copy the name of the pod under the cursor."
   (interactive)
-  (kill-new (kubel--get-resource-under-cursor))
+  (kill-new (kubel--get-name-under-cursor))
   (message "Resource name copied to kill-ring"))
 
 (defun kubel-copy-log-command ()
   "Copy the streaming log command of the pod under the cursor."
   (interactive)
   (kill-new
-   (format "%s logs -f --tail=%s %s"
-           (kubel--get-command-prefix)
-           kubel-log-tail-n
-           (if (kubel--is-pod-view)
-               (kubel--get-resource-under-cursor)
-             (kubel--select-resource "Pods"))))
+   (let* ((cell (if (kubel--is-pod-view)
+                    (kubel--get-ns-name-under-cursor)
+                  (kubel--select-resource "Pods")))
+          (ns (car cell))
+          (name (cdr cell)))
+     (format "%s logs -f --tail=%s %s"
+             (kubel--kubectl-prefix ns)
+             kubel-log-tail-n
+             name)))
   (message "Log command copied to kill-ring"))
 
 (defun kubel-copy-command-prefix ()
   "Copy the kubectl command prefix."
   (interactive)
-  (kill-new (kubel--get-command-prefix))
+  (kill-new (kubel--kubectl-prefix kubel-namespace))
   (message "Command prefix copied to kill-ring"))
 
 (defun kubel-copy-last-command ()
@@ -824,8 +1723,10 @@ ARGS is the arguments list from transient."
   "Get namespaces for current context, try to recover from cache first."
   (unless kubel--namespace-list-cached
     (setq kubel--namespace-list-cached
-          (split-string (kubel--exec-to-string
-                         (format "%s --context %s get namespace -o jsonpath='{.items[*].metadata.name}'" kubel-kubectl kubel-context)) " ")))
+          (append
+           (list kubel--all-namespaces-entry)
+           (split-string (kubel--exec-to-string
+                          (format "%s --context %s get namespace -o jsonpath='{.items[*].metadata.name}'" kubel-kubectl kubel-context)) " "))))
   kubel--namespace-list-cached)
 
 (defun kubel--list-namespace ()
@@ -845,7 +1746,8 @@ If called with a prefix argument REFRESH, refreshes
 the context caches, including the cached resource list."
   (interactive "P")
   (when refresh (kubel--invalidate-context-caches))
-  (let* ((namespace (completing-read "Namespace: " (kubel--list-namespace)
+  (let* ((namespace (completing-read "Namespace: "
+                                     (kubel--list-namespace)
                                      nil nil nil nil "default"))
          (kubel--buffer (get-buffer (kubel--buffer-name)))
          (last-default-directory (when kubel--buffer
@@ -854,7 +1756,7 @@ the context caches, including the cached resource list."
       (setq kubel-namespace namespace)
       (kubel--add-namespace-to-history namespace)
       (switch-to-buffer (current-buffer))
-      (kubel-refresh last-default-directory))))
+      (kubel-refresh nil last-default-directory))))
 
 (defun kubel-set-context ()
   "Set the context."
@@ -869,38 +1771,57 @@ the context caches, including the cached resource list."
       (kubel--invalidate-context-caches)
       (setq kubel-namespace "default")
       (switch-to-buffer (current-buffer))
-      (kubel-refresh last-default-directory))))
+      (kubel-refresh nil last-default-directory))))
 
-(defun kubel--add-selector-to-history (selector)
+(defun kubel--add-selector-to-history (selectors)
   "Add SELECTOR to history if it isn't there already."
-  (unless (member selector kubel-selector-history)
-    (push selector kubel-selector-history)))
+  (dolist (selector selectors kubel-selector-history)
+    (unless (member selector kubel-selector-history)
+      (push selector kubel-selector-history))))
 
 (defun kubel--get-all-selectors ()
   "Get all selectors."
   (unless kubel--label-values-cached
-    (let ((labels (kubel--get-pod-labels)))
+    (let ((labels (kubel--get-pod-labels kubel-namespace)))
       (setq kubel--label-values-cached labels)))
   kubel--label-values-cached)
+
+(defvar kubel--selector-finish-choice "*FINISH*")
 
 (defun kubel--list-selectors ()
   "List selector expressions from history."
   (delete-dups
-   (append '("none") (kubel--get-all-selectors)
+   (append (list kubel--selector-finish-choice)
+           (kubel--get-all-selectors)
            kubel-selector-history)))
 
 (defun kubel-set-label-selector ()
   "Set the selector."
   (interactive)
   (with-current-buffer (clone-buffer)
-    (let ((selector (completing-read
-                     "Selector: "
-                     (kubel--list-selectors))))
-      (when (equal selector "none")
-        (setq selector ""))
-      (setq kubel-selector selector))
-    (kubel--add-selector-to-history kubel-selector)
+    (setq kubel-selectors '())
+    (let ((selector nil))
+      (while (not (string-equal selector kubel--selector-finish-choice))
+        (setq selector (completing-read
+                        (format "Selector (current: %s): "
+                                (if (kubel--empty? kubel-selectors)
+                                    "none"
+                                  (mapconcat #'identity kubel-selectors " ")))
+                        (kubel--list-selectors)))
+        (unless (or (equal selector kubel--selector-finish-choice)
+                    (member selector kubel-selectors))
+          (push selector kubel-selectors))))
+    ;; TODO: fix history
+    (kubel--add-selector-to-history kubel-selectors)
     ;; Update pod list according to the label selector
+    (switch-to-buffer (current-buffer))
+    (kubel-refresh)))
+
+(defun kubel-set-field-selector ()
+  "Set the field selector."
+  (interactive)
+  (with-current-buffer (clone-buffer)
+    (setq kubel-field-selectors (read-string "Field selector(s): " kubel-field-selectors))
     (switch-to-buffer (current-buffer))
     (kubel-refresh)))
 
@@ -916,14 +1837,14 @@ the context caches, including the cached resource list."
   (interactive "P")
   (when refresh (kubel--invalidate-context-caches))
   (let* ((current-buffer-name (kubel--buffer-name))
-         (resource-list (kubel--kubernetes-resources-list))
+         (resource-list (kubel--kubernetes-api-resources-list))
          (kubel--buffer (get-buffer current-buffer-name))
          (last-default-directory (when kubel--buffer (with-current-buffer kubel--buffer default-directory))))
     (with-current-buffer (clone-buffer)
-      (setq kubel-resource
+      (setq kubel-resource-type
             (completing-read "Select resource: " resource-list))
       (switch-to-buffer (current-buffer))
-      (kubel-refresh last-default-directory))))
+      (kubel-refresh nil last-default-directory))))
 
 (defun kubel-set-output-format ()
   "Set output format of kubectl."
@@ -939,33 +1860,38 @@ the context caches, including the cached resource list."
 P can be a single number or a localhost:container port pair."
   (interactive "sPort: ")
   (let* ((port (if (string-match-p ":" p) p (format "%s:%s" p p)))
-         (pod (if (kubel--is-pod-view)
-                  (kubel--get-resource-under-cursor)
-                (kubel--select-resource "Pods")))
-         (process-name (format "kubel - port-forward - %s:%s" pod port)))
-    (kubel--exec process-name (list "port-forward" pod port))))
+         (cell (if (kubel--is-pod-view)
+                   (kubel--get-ns-name-under-cursor)
+                 (kubel--select-resource "Pods")))
+         (ns (car cell))
+         (name (cdr cell))
+         (process-name (format "kubel - port-forward - %s:%s" name port)))
+    (kubel--exec process-name ns 'port-forward (list "port-forward" name port))))
 
-(defun kubel-setup-tramp ()
+(defun kubel-setup-tramp (ns)
   "Setup a kubectl TRAMP."
   (setq tramp-methods (delete (assoc "kubectl" tramp-methods) tramp-methods)) ;; cleanup previous tramp method
   ;; TODO error message if resource is not pod
   (add-to-list 'tramp-methods
                `("kubectl"
                  (tramp-login-program      ,kubel-kubectl)
-                 (tramp-login-args         (,(kubel--get-context-namespace) ("exec" "-it") ("-c" "%u") ("%h") ("--" "sh")))
+                 (tramp-login-args         (,(kubel--get-context-kubectl-arg) ,(kubel--get-ns-kubectl-arg ns) ("exec" "-it") ("-c" "%u") ("%h") ("--" "sh")))
                  (tramp-remote-shell       "sh")
                  (tramp-remote-shell-args  ("-i" "-c"))))) ;; add the current context/namespace to tramp methods
 
+;; TODO: maybe redefine it to (ns . (pod . container)), simplify
 (defun kubel--get-container-under-cursor ()
   "Get `(container . pod)' name under cursor."
-  (let* ((pod (if (kubel--is-pod-view)
-                  (kubel--get-resource-under-cursor)
-                (kubel--select-resource "Pods")))
-         (containers (kubel--get-containers pod))
+  (let* ((cell (if (kubel--is-pod-view)
+                   (kubel--get-ns-name-under-cursor)
+                 (kubel--select-resource "Pods")))
+         (ns (car cell))
+         (name (cdr cell))
+         (containers (kubel--get-containers ns name))
          (container (if (equal (length containers) 1)
                         (car containers)
                       (completing-read "Select container: " containers))))
-    (cons container pod)))
+    (cons container name)))
 
 (defun kubel--dir-prefix ()
   "Return the current directory prefix for a TRAMP connection."
@@ -978,7 +1904,7 @@ P can be a single number or a localhost:container port pair."
 (defun kubel-exec-pod ()
   "Exec into the pod under the cursor -> `find-file."
   (interactive)
-  (kubel-setup-tramp)
+  (kubel-setup-tramp (kubel--get-ns-under-cursor))
   (let* ((dir-prefix (kubel--dir-prefix))
          (con-pod (kubel--get-container-under-cursor)))
     (find-file (format "/%skubectl:%s@%s:/" dir-prefix (car con-pod) (cdr con-pod)))))
@@ -1002,7 +1928,7 @@ the variables `kubel-namespace' and `kubel-context', respectively."
 (defun kubel-exec-shell-pod ()
   "Exec into the pod under the cursor -> shell."
   (interactive)
-  (kubel-setup-tramp)
+  (kubel-setup-tramp (kubel--get-ns-under-cursor))
   (let* ((dir-prefix (kubel--dir-prefix))
          (con-pod (kubel--get-container-under-cursor))
          (container (car con-pod))
@@ -1013,7 +1939,7 @@ the variables `kubel-namespace' and `kubel-context', respectively."
 (defun kubel-exec-eshell-pod ()
   "Exec into the pod under the cursor -> eshell."
   (interactive)
-  (kubel-setup-tramp)
+  (kubel-setup-tramp (kubel--get-ns-under-cursor))
   (let* ((dir-prefix (kubel--dir-prefix))
          (con-pod (kubel--get-container-under-cursor))
          (container (car con-pod))
@@ -1026,7 +1952,7 @@ the variables `kubel-namespace' and `kubel-context', respectively."
 (defun kubel-exec-vterm-pod ()
   "Exec into the pod under the cursor -> vterm."
   (interactive)
-  (kubel-setup-tramp)
+  (kubel-setup-tramp (kubel--get-ns-under-cursor))
   (let* ((dir-prefix (kubel--dir-prefix))
          (con-pod (kubel--get-container-under-cursor))
          (container (car con-pod))
@@ -1047,11 +1973,12 @@ the variables `kubel-namespace' and `kubel-context', respectively."
 (defun kubel-exec-ansi-term-pod ()
   "Exec into the pod under the cursor -> `ansi-term'."
   (interactive)
-  (let* ((con-pod (kubel--get-container-under-cursor))
+  (let* ((ns (kubel--get-ns-under-cursor))
+         (con-pod (kubel--get-container-under-cursor))
          (container (car con-pod))
-         (pod (cdr con-pod))
-         (command (format "%s exec %s -c %s -i -t -- /usr/bin/env sh" (kubel--get-command-prefix) pod container)))
-    (with-current-buffer (ansi-term "bash" (kubel--shell-buffer-name "ansi-term" container pod))
+         (name (cdr con-pod))
+         (command (format "%s exec %s -c %s -i -t -- /usr/bin/env sh" (kubel--kubectl-prefix ns) name container)))
+    (with-current-buffer (ansi-term "bash" (kubel--shell-buffer-name "ansi-term" container name))
       (process-send-string (current-buffer) (format "%s\n" command)))))
 
 (defun kubel-exec-eat-pod ()
@@ -1059,7 +1986,7 @@ the variables `kubel-namespace' and `kubel-context', respectively."
   (interactive)
   (unless (fboundp 'eat-other-window)
     (user-error "This command requires the `eat' package."))
-  (kubel-setup-tramp)
+  (kubel-setup-tramp (kubel--get-ns-under-cursor))
   (let* ((dir-prefix (kubel--dir-prefix))
          (con-pod (kubel--get-container-under-cursor))
          (container (car con-pod))
@@ -1071,22 +1998,27 @@ the variables `kubel-namespace' and `kubel-context', respectively."
 (defun kubel-exec-pod-by-shell-command ()
   "Prompt shell with kubectl exec command at pod under cursor."
   (interactive)
-  (kubel-setup-tramp)
   (let* ((con-pod (kubel--get-container-under-cursor))
-         (command (read-string "Shell command: " (format "%s exec %s -c %s -- " (kubel--get-command-prefix) (cdr con-pod) (car con-pod)))))
+         (command (read-string "Shell command: "
+                              (format "%s exec %s -c %s -- " (kubel--kubectl-prefix kubel-namespace) (cdr con-pod) (car con-pod)))))
+    (kubel-setup-tramp (kubel--get-ns-under-cursor))
     (shell-command command)))
+
 
 (defun kubel-delete-resource ()
   "Kubectl delete resource under cursor."
   (interactive)
-  (dolist (pod (if (kubel--items-selected-p)
-                   kubel--selected-items
-                 (list (kubel--get-resource-under-cursor))))
-    (let* ((process-name (format "kubel - delete %s - %s" kubel-resource pod))
-           (args (list "delete" kubel-resource pod)))
-      (when (transient-args 'kubel-delete-popup)
-        (setq args (append args (list "--force" "--grace-period=0"))))
-      (kubel--exec process-name args))))
+  (dolist (resource (if (kubel--items-selected?)
+                        (ht-keys kubel--selected-items-set)
+                      (list (kubel--get-ns-name-under-cursor))))
+    (let* ((ns (car resource))
+           (name (cdr resource))
+           (process-name (format "kubel - delete %s - %s" kubel-resource-type name))
+           (args (list "delete" kubel-resource-type name)))
+     (when (transient-args 'kubel-delete-popup)
+       (setq args (append args (list "--force" "--grace-period=0"))))
+     (kubel--exec process-name ns 'delete args)
+     (kubel-refresh))))
 
 (defun kubel-jab-deployment ()
   "Make a trivial patch to force a new deployment.
@@ -1094,14 +2026,17 @@ the variables `kubel-namespace' and `kubel-context', respectively."
 See https://github.com/kubernetes/kubernetes/issues/27081"
   (interactive)
   (dolist (deployment (if (kubel--is-deployment-view)
-                          (if (kubel--items-selected-p)
-                              kubel--selected-items
-                            (list (kubel--get-resource-under-cursor)))
+                          (if (kubel--items-selected?)
+                              (ht-keys kubel--selected-items-set)
+                            (list (kubel--get-ns-name-under-cursor)))
                         (list (kubel--select-resource "Deployments"))))
-    (let ((process-name (format "kubel - bouncing - %s" deployment)))
-      (kubel--exec process-name (list "patch" "deployment" deployment "-p"
-                                      (format "{\"spec\":{\"template\":{\"metadata\":{\"labels\":{\"date\":\"%s\"}}}}}"
-                                              (round (time-to-seconds))))))))
+    (let* ((ns (car deployment))
+           (name (cdr deployment))
+           (process-name (format "kubel - bouncing - %s" name)))
+      (kubel--exec process-name ns 'patch
+                   (list "patch" "deployment" name "-p"
+                         (format "{\"spec\":{\"template\":{\"metadata\":{\"labels\":{\"date\":\"%s\"}}}}}"
+                                 (round (time-to-seconds))))))))
 
 (defun kubel-scale-replicas (replicas)
   "Scale resource replicas.
@@ -1109,19 +2044,19 @@ See https://github.com/kubernetes/kubernetes/issues/27081"
 REPLICAS is the number of desired replicas."
   (interactive (list (read-number "Replicas: ")))
   (if (kubel--is-scalable)
-      (let* ((resource (kubel--get-resource-under-cursor))
-             (process-name (format "kubel:scale:%s/%s" kubel-resource resource)))
-        (kubel--exec process-name (list "scale" kubel-resource resource "--replicas" (number-to-string replicas))))
+      (let* ((cell (kubel--get-ns-name-under-cursor))
+             (ns (car cell))
+             (name (cdr cell))
+             (process-name (format "kubel:scale:%s/%s" kubel-resource-type name)))
+        (kubel--exec process-name ns 'scale (list "scale" kubel-resource-type name "--replicas" (number-to-string replicas))))
     (message
-     "[%s] cannot be scaled.\nOnly these resources can be scaled: [deployment, replica set, replication controller, and stateful set]."
-     kubel-resource)))
+     "[%s] cannot be scaled.\nOnly these resources can be scaled: [deployment, replica set and stateful set]."
+     kubel-resource-type)))
 
-(defun kubel-set-filter (filter)
-  "Set the pod filter.
-
-FILTER is the filter string."
-  (interactive "MFilter: ")
-  (setq kubel-resource-filter filter)
+(defun kubel-set-filter ()
+  "Set the view filter."
+  (interactive)
+  (setq kubel-resource-filter (read-string "Filter: " kubel-resource-filter))
   (kubel-refresh))
 
 (defun kubel--jump-to-highlight (init search reset)
@@ -1156,7 +2091,11 @@ RESET is to be called if the search is nil after the first attempt."
 (defun kubel-rollout-history ()
   "See rollout history for resource under cursor."
   (interactive)
-  (kubel--show-rollout-revision kubel-resource (kubel--get-resource-under-cursor)))
+  ;; TODO: implement view type constraints for resource types it makes sense for
+  (let* ((cell (kubel--get-ns-name-under-cursor))
+         (ns (car cell))
+         (name (cdr cell)))
+    (kubel--show-rollout-revision kubel-resource-type ns name)))
 
 (defun kubel-changelog ()
   "Opens up the changelog."
@@ -1166,8 +2105,8 @@ RESET is to be called if the search is nil after the first attempt."
 (defun kubel-quick-edit ()
   "Quickly edit any resource."
   (interactive)
-  (kubel--describe-resource
-   (completing-read "Select resource: " (kubel--kubernetes-resources-list))))
+  (kubel--describe-object
+   (completing-read "Select resource: " (kubel--kubernetes-api-resources-list))))
 
 (defun kubel-show-process-buffer ()
   "Show the kubel-process-buffer."
@@ -1176,40 +2115,48 @@ RESET is to be called if the search is nil after the first attempt."
   (special-mode))
 
 (defun kubel-mark-item ()
-  "Mark or unmark the item under cursor."
+  "Mark the item under cursor."
   (interactive)
-  (let ((item (kubel--get-resource-under-cursor)))
-    (unless (-contains? kubel--selected-items item)
-      (progn
-        (push item kubel--selected-items)
-        (forward-line 1)
-        (kubel-refresh)))))
+  (let ((item (kubel--get-ns-name-under-cursor)))
+    (unless (ht-contains? kubel--selected-items-set item)
+      (ht-set kubel--selected-items-set item t)
+      (kubel-refresh t))
+    (forward-line 1)))
 
-(defun kubel-unmark-item ()
-  "Unmark the item under cursor."
+(defun kubel-unmark-item (&optional backward)
+  "Unmark the item under cursor.
+
+BACKWARD moves back one line if set."
   (interactive)
-  (let ((item (kubel--get-resource-under-cursor)))
-    (when (-contains? kubel--selected-items item)
-      (progn
-        (setq kubel--selected-items (delete item kubel--selected-items))
-        (kubel-refresh)))))
+  (let ((item (kubel--get-ns-name-under-cursor)))
+    (when (ht-contains? kubel--selected-items-set item)
+      (ht-remove kubel--selected-items-set item)
+      (kubel-refresh t))
+    (if backward
+        (forward-line -1)
+      (forward-line 1))))
+
+(defun kubel-unmark-item-backward ()
+  "Unmark the item under cursor and move it backwards."
+  (interactive)
+  (kubel-unmark-item t))
 
 (defun kubel-mark-all ()
-  "Mark all items."
-  (interactive)
-  (setq kubel--selected-items '())
-  (save-excursion
-    (goto-char (point-min))
-    (while (not (eobp))
-      (push (kubel--get-resource-under-cursor) kubel--selected-items)
-      (forward-line 1)))
-  (kubel-refresh))
+ "Mark all items."
+ (interactive)
+ (ht-clear kubel--selected-items-set)
+ (save-excursion
+   (goto-char (point-min))
+   (while (not (eobp))
+     (ht-set kubel--selected-items-set (kubel--get-ns-name-under-cursor) t)
+     (forward-line 1)))
+ (kubel-refresh t))
 
 (defun kubel-unmark-all ()
   "Unmark all items."
   (interactive)
-  (setq kubel--selected-items '())
-  (kubel-refresh))
+  (ht-clear kubel--selected-items-set)
+  (kubel-refresh t))
 
 (defun kubel--read-buffer ()
   "Return the list of all buffers of kubel pattern."
@@ -1235,6 +2182,93 @@ When called interactively, prompts for a buffer belonging to kubel."
   (interactive (list (kubel--read-buffer)))
   (switch-to-buffer buffer-or-name))
 
+(defun kubel--find-resource-type-alias (resource-type)
+  "Function to find an alias to a given resource-type that exists in the
+cluster.
+
+RESOURCE-TYPE is a resource-type."
+  (let ((alias nil))
+    (dolist (possible-alias (ht-get kubel--resource-type->aliases-ht resource-type) alias)
+      (if (member possible-alias (kubel--kubernetes-api-resources-list))
+          (setq alias possible-alias)))))
+
+(defun kubel--select-only (ns name)
+  "Utility function to set selected items to a single item.
+
+NS is object's namespace.
+NAME is object's name."
+  (ht-clear kubel--selected-items-set)
+  (ht-set kubel--selected-items-set (cons ns name) t))
+
+(defun kubel-jump-to-owner ()
+  (interactive)
+  (let* ((ns-name (kubel--get-ns-name-under-cursor))
+         (ns (car ns-name))
+         (name (cdr ns-name))
+         (json-object (json-parse-string (kubel--exec-to-string (format "%s --context %s --namespace %s get %s %s -o json"
+                                                                        kubel-kubectl kubel-context ns kubel-resource-type name))))
+         (owner-reference (aref (ht-get* json-object "metadata" "ownerReferences") 0))
+         (owner-kind (ht-get owner-reference "kind"))
+         (owner-name (ht-get owner-reference "name"))
+         (owner-kind-plural (ht-get kubel--resource-type-singular->plural-ht owner-kind))
+         (owner-kind-actual (kubel--find-resource-type-alias owner-kind-plural)))
+    (if (null owner-reference)
+        (message "Object has no owner.")
+      (with-current-buffer (clone-buffer)
+        (setq kubel-resource-type owner-kind-actual)
+        (kubel--select-only ns owner-name)
+        (setq kubel-selectors '())
+        (switch-to-buffer (current-buffer))
+        (kubel-refresh)
+        ;; set the cursor to the marked line
+        (forward-line -1)))))
+
+(defun kubel-jump-to-children ()
+  (interactive)
+  (cond ((s-equals? "nodes" kubel-resource-type)
+         (let* ((ns-name (kubel--get-ns-name-under-cursor))
+                (name (cdr ns-name)))
+           (with-current-buffer (clone-buffer)
+             (setq kubel-resource-type "pods")
+             (setq kubel-field-selectors (format "spec.nodeName=%s" name))
+             (switch-to-buffer (current-buffer))
+             (kubel-refresh))))
+        (t
+         (let* ((ns-name (kubel--get-ns-name-under-cursor))
+                (ns (car ns-name))
+                (name (cdr ns-name))
+                (json-object (json-parse-string (kubel--exec-to-string (format "%s --context %s --namespace %s get %s %s -o json"
+                                                                               kubel-kubectl kubel-context ns kubel-resource-type name))))
+                (owner-match-labels (ht-get* json-object "spec" "selector" "matchLabels"))
+                (owner-kind-plural kubel-resource-type)
+                (owner-kind-internal (ht-get kubel--resource-type->internal-type-ht owner-kind-plural))
+                (child-kind-internal (asoc-get kubel--internal-type-ownership-alist owner-kind-internal))
+                (child-kind-alias (car (asoc-get kubel--internal-type-resource-type-alias-alist child-kind-internal)))
+                (child-kind-actual (kubel--find-resource-type-alias child-kind-alias)))
+           (with-current-buffer (clone-buffer)
+             (setq kubel-resource-type child-kind-actual)
+             (setq kubel-selectors (mapcar (lambda (label-value) (format "%s=%s" (car label-value) (cadr label-value)))
+                                           (ht-items owner-match-labels)))
+             (switch-to-buffer (current-buffer))
+             (kubel-refresh))))))
+
+(defun kubel-jump-to-node ()
+  (interactive)
+  (if (not (kubel--is-pod-view))
+      (error "Not in the pod view.")
+    (let* ((ns-name (kubel--get-ns-name-under-cursor))
+           (ns (car ns-name))
+           (name (cdr ns-name))
+           (json-object (json-parse-string (kubel--exec-to-string (format "%s --context %s --namespace %s get %s %s -o json"
+                                                                          kubel-kubectl kubel-context ns kubel-resource-type name))))
+           (node-name (ht-get* json-object "spec" "nodeName"))
+           (nodes-resource-type "nodes"))
+      (with-current-buffer (clone-buffer)
+        (setq kubel-resource-type nodes-resource-type)
+        (setq kubel-field-selectors (concat "metadata.name=" node-name))
+        (switch-to-buffer (current-buffer))
+        (kubel-refresh)))))
+
 ;; popups
 
 (transient-define-prefix kubel-exec-popup ()
@@ -1247,10 +2281,47 @@ When called interactively, prompts for a buffer belonging to kubel."
    ("t" "eat" kubel-exec-eat-pod)
    ("s" "Shell" kubel-exec-shell-pod)])
 
+(transient-define-prefix kubel-configure-popup ()
+  "Kubel Configure Menu"
+  ["Actions"
+   ("c" "Context" kubel-set-context)
+   ("n" "Namespace" kubel-set-namespace)
+   ("r" "Resource Type" kubel-set-resource)
+   ("f" "Config file" kubel-set-kubectl-config-file)])
+
+(transient-define-prefix kubel-filtering-popup ()
+  "Kubel Format/Filtering Menu"
+  ["Actions"
+   ("c" "Toggle complex views" toggle-kubel-complex-views)
+   ("h" "Toggle regex filter hides" toggle-kubel-filter-hides)
+   ("r" "Regex filter" kubel-set-filter)
+   ("o" "Output format" kubel-set-output-format)
+   ("f" "Field selector" kubel-set-field-selector)
+   ("l" "Label selector" kubel-set-label-selector)])
+
+(transient-define-prefix kubel-resource-popup ()
+  "Kubel Resource Menu"
+  ["Actions"
+   ("e" "Exec" kubel-exec-popup)
+   ("j" "Jab deployment" kubel-jab-deployment)
+   ("r" "Rollout history" kubel-rollout-history)
+   ("s" "Scale" kubel-scale-replicas)
+   ("p" "Port forward" kubel-port-forward-pod)
+   ("l" "Logs" kubel-log-popup)
+   ("k" "Delete" kubel-delete-popup)])
+
+(transient-define-prefix kubel-jump-popup ()
+  "Kubel Jump Menu"
+  ["Actions"
+   ("o" "Owner" kubel-jump-to-owner)
+   ("c" "Children" kubel-jump-to-children)
+   ("n" "Node" kubel-jump-to-node)])
+
 (transient-define-prefix kubel-log-popup ()
   "Kubel Log Menu"
   ["Arguments"
    ("-f" "Follow" "-f")
+   ("-t" "Timestamps" "--timestamps")
    ("-p" "Previous" "-p")
    ("-n" "Tail" "--tail=")]
   ["Actions"
@@ -1261,10 +2332,10 @@ When called interactively, prompts for a buffer belonging to kubel."
 (transient-define-prefix kubel-copy-popup ()
   "Kubel Copy Menu"
   ["Actions"
-   ("c" "Copy resource name" kubel-copy-resource-name)
+   ("w" "Copy resource name" kubel-copy-resource-name)
    ("l" "Copy pod log command" kubel-copy-log-command)
    ("p" "Copy command prefix" kubel-copy-command-prefix)
-   ("C" "Copy last command" kubel-copy-last-command)])
+   ("c" "Copy last command" kubel-copy-last-command)])
 
 (transient-define-prefix kubel-delete-popup ()
   "Kubel Delete menu"
@@ -1278,77 +2349,64 @@ When called interactively, prompts for a buffer belonging to kubel."
   ["Arguments"
    ("-y" "Yaml" "-o yaml")]
   ["Actions"
-   ("RET" "Describe" kubel-get-resource-details)])
+   ("RET" "Describe" kubel-get-object-details)])
 
 (transient-define-prefix kubel-help-popup ()
   "Kubel Menu"
   [["Actions"
     ;; global
     ("RET" "Resource details" kubel-describe-popup)
-    ("E" "Quick edit" kubel-quick-edit)
+    ("e" "Quick edit" kubel-quick-edit)
     ("g" "Refresh" kubel-refresh)
-    ("b" "Buffers" kubel-switch-to-buffer)
-    ("k" "Delete" kubel-delete-popup)
-    ("r" "Rollout" kubel-rollout-history)]
-   ["" ;; based on current view
-    ("p" "Port forward" kubel-port-forward-pod)
-    ("l" "Logs" kubel-log-popup)
-    ("e" "Exec" kubel-exec-popup)
-    ("j" "Jab" kubel-jab-deployment)
-    ("S" "Scale replicas" kubel-scale-replicas)]
-   ["Settings"
-    ("C" "Set context" kubel-set-context)
-    ("n" "Set namespace" kubel-set-namespace)
-    ("R" "Set resource" kubel-set-resource)
-    ("K" "Set kubectl config file" kubel-set-kubectl-config-file)
-    ("F" "Set output format" kubel-set-output-format)]
-   ["Filter"
-    ("f" "Filter" kubel-set-filter)
+    ("b" "Buffers" kubel-switch-to-buffer)]
+   [""
+    ("c" "Configure..." kubel-configure-popup)
+    ("r" "Act on resource..." kubel-resource-popup)
+    ("j" "Jump to resource..." kubel-jump-popup)]
+   ["Filtering"
+    ("f" "Output and filtering..." kubel-filtering-popup)
+    ("s" "Sort" kubel-sort-by-column-at-point)
+    ("S" "Revert sorting" kubel-sort-revert)
     ("M-n" "Next highlight" kubel-jump-to-next-highlight)
-    ("M-p" "Previous highlight" kubel-jump-to-previous-highlight)
-    ("s" "Set label selector" kubel-set-label-selector)]
+    ("M-p" "Previous highlight" kubel-jump-to-previous-highlight)]
    ["Marking"
     ("m" "Mark item" kubel-mark-item)
     ("u" "Unmark item" kubel-unmark-item)
+    ("DEL" "Unmark item and move back" kubel-unmark-item-backward)
     ("M" "Mark all items" kubel-mark-all)
     ("U" "Unmark all items" kubel-unmark-all)]
    ["Utilities"
-    ("c" "Copy to clipboad..." kubel-copy-popup)
+    ("w" "Copy to clipboad..." kubel-copy-popup)
     ("$" "Show Process buffer" kubel-show-process-buffer)]])
 
 ;; mode map
 (defvar kubel-mode-map
   (let ((map (make-sparse-keymap)))
     ;; global
-    (define-key map (kbd "RET") 'kubel-get-resource-details)
-    (define-key map (kbd "K") 'kubel-set-kubectl-config-file)
-    (define-key map (kbd "C") 'kubel-set-context)
-    (define-key map (kbd "n") 'kubel-set-namespace)
+    (define-key map (kbd "RET") 'kubel-get-object-details)
+    (define-key map (kbd "e") 'kubel-quick-edit)
     (define-key map (kbd "g") 'kubel-refresh)
+    (define-key map (kbd "b") 'kubel-switch-to-buffer)
+    (define-key map (kbd "$") 'kubel-show-process-buffer)
+    (define-key map (kbd "c") 'kubel-configure-popup)
     (define-key map (kbd "h") 'kubel-help-popup)
     (define-key map (kbd "?") 'kubel-help-popup)
-    (define-key map (kbd "F") 'kubel-set-output-format)
-    (define-key map (kbd "R") 'kubel-set-resource)
-    (define-key map (kbd "k") 'kubel-delete-popup)
-    (define-key map (kbd "f") 'kubel-set-filter)
-    (define-key map (kbd "r") 'kubel-rollout-history)
-    (define-key map (kbd "E") 'kubel-quick-edit)
+    (define-key map (kbd "f") 'kubel-filtering-popup)
+    (define-key map (kbd "r") 'kubel-resource-popup)
+    (define-key map (kbd "j") 'kubel-jump-popup)
+    (define-key map (kbd "w") 'kubel-copy-popup)
+    (define-key map (kbd "s") 'kubel-sort-by-column-at-point)
+    (define-key map (kbd "S") 'kubel-sort-revert)
     (define-key map (kbd "M-n") 'kubel-jump-to-next-highlight)
     (define-key map (kbd "M-p") 'kubel-jump-to-previous-highlight)
-    (define-key map (kbd "$") 'kubel-show-process-buffer)
-    (define-key map (kbd "s") 'kubel-set-label-selector)
-    (define-key map (kbd "b") 'kubel-switch-to-buffer)
-    ;; based on view
-    (define-key map (kbd "p") 'kubel-port-forward-pod)
-    (define-key map (kbd "S") 'kubel-scale-replicas)
-    (define-key map (kbd "l") 'kubel-log-popup)
-    (define-key map (kbd "c") 'kubel-copy-popup)
-    (define-key map (kbd "e") 'kubel-exec-popup)
-    (define-key map (kbd "!") 'kubel-exec-pod-by-shell-command)
-    (define-key map (kbd "j") 'kubel-jab-deployment)
 
+    ;; based on view
+    (define-key map (kbd "w") 'kubel-copy-popup)
+
+    ;; (define-key map (kbd "m") 'kubel-mark-item)
     (define-key map (kbd "m") 'kubel-mark-item)
     (define-key map (kbd "u") 'kubel-unmark-item)
+    (define-key map (kbd "DEL") 'kubel-unmark-item-backward)
     (define-key map (kbd "M") 'kubel-mark-all)
     (define-key map (kbd "U") 'kubel-unmark-all)
 
@@ -1356,14 +2414,58 @@ When called interactively, prompts for a buffer belonging to kubel."
   "Keymap for `kubel-mode'.")
 
 (defun kubel--current-state ()
-  "Show in the Echo Area the current context, namespace, and resource."
+  "Show the current context, namespace, and resource in the Echo Area.
+Append filter to the modeline."
+  (setq mode-line-misc-info
+        (mapconcat 'identity (append
+                              (unless (s-blank? kubel-resource-filter)
+                                (list (format "/%s" kubel-resource-filter))))
+                             " "))
   (message (concat
-            (format "[Context: %s] [Namespace: %s] [Resource: %s]" kubel-context kubel-namespace kubel-resource)
-            (unless (equal kubel-selector "")
-              (format " (%s)" kubel-selector)))))
+            (format "[Context: %s] [Namespace: %s] [Resource: %s]" kubel-context kubel-namespace kubel-resource-type)
+            (unless (and (kubel--empty? kubel-selectors) (s-blank? kubel-field-selectors))
+              (concat " (" (mapconcat #'identity
+                                      (append kubel-selectors
+                                              (unless (s-blank? kubel-field-selectors)
+                                                (list kubel-field-selectors)))
+                                      " ")
+                      ")"))
+            (unless (equal kubel-resource-filter "")
+              (format " /%s" kubel-resource-filter)))))
+
+(defun kubel--ns (item-alist)
+  "Utility function to get namespace of list item's alist"
+  (cond
+   ((kubel--resource-type-global? kubel-resource-type) nil)
+   (kubel--all-namespaces-view (asoc-get item-alist "NAMESPACE"))
+   (t kubel-namespace)))
+
+(defun kubel--populate-view-entries (entries)
+  "Function to populate kubel--ns-name->columns-alist variable."
+  (ht-clear kubel--ns-name->columns-alist)
+  (let ((column-names (car entries)))
+    (dolist (values (cdr entries))
+      (let ((item-alist (asoc-make)))
+        ;; used for side effects
+        (cl-mapcar (lambda (column-name value)
+                     (asoc-put! item-alist column-name value))
+                   column-names values)
+        (let ((ns (kubel--ns item-alist))
+              (name (asoc-get item-alist "NAME")))
+          (ht-set kubel--ns-name->columns-alist (cons ns name) (reverse item-alist)))))))
+
+
+(defun kubel--get-global-resources-set ()
+  (if (ht-empty? kubel--global-resources-set-cached)
+      (let ((global-resources (split-string (kubel--exec-to-string
+                                             (format "%s --context %s api-resources --namespaced=false -o name"
+                                                     kubel-kubectl kubel-context)))))
+        (dolist (entry global-resources)
+          (ht-set kubel--global-resources-set-cached entry t))))
+  kubel--global-resources-set-cached)
 
 ;;;###autoload
-(defun kubel-refresh (&optional directory)
+(defun kubel-refresh (&optional no-refresh directory)
   "Refresh the current kubel buffer, calling kubectl using the configured
 context, namespace, and resource.
 
@@ -1376,10 +2478,16 @@ DIRECTORY is optional for TRAMP support."
         (unless (equal (buffer-name (current-buffer)) name)
           (kill-buffer (get-buffer name))))
     (rename-buffer name)
-    (message (format "Running kubectl for: %s..." name)))
-  (let ((entries (kubel--populate-list)))
+    (unless no-refresh
+      (message (format "Running kubectl for: %s..." name))))
+  (if (and (kubel--all-namespaces?)
+           (not (kubel--resource-type-global? kubel-resource-type)))
+      (setq kubel--all-namespaces-view t)
+    (setq kubel--all-namespaces-view nil))
+  (let ((entries (kubel--populate-list no-refresh)))
     (setq tabulated-list-format (car entries))
     (setq tabulated-list-entries (cadr entries)))   ; TODO handle "No resource found"
+  (kubel--update-selected-items)
   (setq tabulated-list-sort-key kubel--list-sort-key)
   (setq tabulated-list-sort-key nil)
   (tabulated-list-init-header)
@@ -1391,7 +2499,16 @@ DIRECTORY is optional for TRAMP support."
       ;; keeping the same line.
       (goto-char (point-min))
       (forward-line (1- line-num))))
-  (kubel--current-state))
+  (when kubel--last-column-sorted
+    (tabulated-list-sort kubel--last-column-sorted))
+  (unless no-refresh
+    (kubel--current-state)))
+
+(defun toggle-kubel-filter-hides ()
+  (interactive)
+  (setq kubel-filter-hides (not kubel-filter-hides))
+  (message "Kubel regex filter hides %s" (if kubel-filter-hides "enabled" "disabled"))
+  (kubel-refresh))
 
 ;;;###autoload
 (defun kubel-open (context namespace resource &optional directory)
@@ -1405,9 +2522,9 @@ DIRECTORY is optional for TRAMP support."
         (kubel-mode)
         (setq kubel-context context)
         (setq kubel-namespace namespace)
-        (setq kubel-resource resource)
+        (setq kubel-resource-type resource)
         (pop-to-buffer-same-window tmpname)
-        (kubel-refresh directory)))))
+        (kubel-refresh nil directory)))))
 
 ;;;###autoload
 (defun kubel (&optional directory)
@@ -1421,7 +2538,7 @@ DIRECTORY is optional for TRAMP support."
       (switch-to-buffer (current-buffer))
       (unless (eq major-mode 'kubel-mode)
         (kubel-mode))
-      (kubel-refresh directory))))
+      (kubel-refresh nil directory))))
 
 (define-derived-mode kubel-mode tabulated-list-mode "Kubel"
   "Special mode for kubel buffers."

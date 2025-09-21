@@ -1,0 +1,162 @@
+* Customize columns in resources view
+* Filtering by arbitrary fields (to enable pod filtered by nodename)
+* Jump to children
+Trees of resources: deployments -> replicasets, replicasets -> pods, services -> pods by selector, etc
+* Jump to owner
+* Jump to node from pod view
+* Sorting by arbitrary columns
+* Option for filtering not to gray out things but hide them completely
+* All namespaces option
+See https://github.com/linktohack/kubel/commit/bdf20c1077dad697be0ddda99455739cb08788be
+(https://github.com/abrochard/kubel/issues/111)
+** DONE kubel--get-resource-cell-under-cursor
+CLOSED: [2025-09-21 Sun 23:12]
+Should return the resource entry from the kubel--view-entries
+** DONE kubel-mark-cell-item
+CLOSED: [2025-09-22 Mon 16:01]
+Should put (ns . name) cell in a list
+** DONE kubel-unmark-cell-item
+CLOSED: [2025-09-22 Mon 19:44]
+Similar
+** DONE kubel--propertize-status
+CLOSED: [2025-09-26 Fri 00:20]
+Should work on key-value pairs
+
+Almost done, add filtering capabilities
+** DONE Introduce visibility property for kubel--populate-list
+CLOSED: [2025-09-26 Fri 00:20]
+To hide unmatched entries by filters
+** DONE Functions that work with selected items must use cons cells to determine the namespace
+CLOSED: [2025-09-26 Fri 00:20]
+** DONE Introduce globally namespaced resources hashset, check against it when setting kubel--all-namespaces-view
+CLOSED: [2025-09-21 Sun 23:08]
+** DONE Populate kubel-global-resource-list
+CLOSED: [2025-09-23 Tue 12:26]
+** DONE Populate kubel-global-resource-list automatically
+CLOSED: [2025-09-26 Fri 00:20]
+Maybe a giant hashtable context->global-set, that's updated the first time the context is switched to X
+Command: kubectl api-resources --namespaced=false -o name
+** Maybe simplify (kubel--all-namespaces-p) usage, use kubel--all-namespaces-view instead
+** DONE Check if clusterrolebindings works with vanilla kubel (can't describe or get)
+CLOSED: [2025-09-23 Tue 12:19]
+** DONE Fix view-entries not setting namespace if not under *ALL* namespaces
+** DONE Replace old usages for new functions list
+CLOSED: [2025-09-26 Fri 00:20]
+- kubel-mark-cell-item
+- kubel-unmark-cell-item
+- kubel-mark-cell-all
+- kubel-unmark-cell-all
+- kubel--get-resource-cell-under-cursor
+- kubel--propertize-item
+- kubel--get-list-entries-cells
+- kubel--populate-view-entries
+- kubel-get-pod-logs-cells
+
+** DONE fix copy pod log command -- no namespace
+CLOSED: [2025-09-24 Wed 16:25]
+** cleanup unused code
+** DONE Move (kubel--populate-view-entries) call to (kubel--populate-list)
+CLOSED: [2025-09-22 Mon 19:51]
+(kubel--populate-list) applies display formatting already; it should populate the view-hashtable _and_ apply formatting
+** DONE kubel--view-entries must be hashtable of assoclists, not hashtable of hashtables
+CLOSED: [2025-09-22 Mon 18:49]
+** DONE marking/unmarking should not trigger full refresh
+CLOSED: [2025-09-23 Tue 11:58]
+** DONE modifying filter should not trigger full refresh
+CLOSED: [2025-09-26 Fri 00:20]
+** fix the naming
+entry is the entity representing the line in the tabulated-list-mode (column: names)
+item is the entity representing a visible resource which you can mark or unmark
+kind is pods, deployments etc
+name is a concrete pod, deployment etc name without kind or namespace
+resource is the k8s representation of the object
+** DONE refactor kubel--exec calls to include namespace
+CLOSED: [2025-09-24 Wed 16:24]
+** DONE refactor kubel--get-context-namespace usages out
+CLOSED: [2025-09-26 Fri 00:21]
+use kubel--get-context-arg and kubel--get-namespace-arg instead
+** DONE in progress: kubel--select-resource usages
+CLOSED: [2025-09-23 Tue 15:48]
+** DONE if in json format, switch to kubel--json-mode
+CLOSED: [2025-09-25 Thu 00:12]
+** DONE field selectors
+CLOSED: [2025-09-26 Fri 00:21]
+** DONE new node/pods view (+ nodes top information if metrics API is available)
+CLOSED: [2025-09-28 Sun 01:58]
+Provide a hashtable of complex views
+For each complex view, define:
+ - a series of kubectl calls
+ - column ordering
+ - maybe some additional rules
+Gather info from multiple kubectl calls into ns-name -> column -> value hashtables
+Merge into ns-name -> column . value alist hashtable
+
+** DONE jump to node from pod
+CLOSED: [2025-09-26 Fri 00:21]
+** changelist
+*** new functionality
+All namespaces support
+Logs follow mode now open buffers in comint-mode
+Optionally hide non-matching entries if filtering
+Add JSON editing mode
+Jump to children
+Jump to owner
+Jump to node's pods
+Multiple label selectors support
+Field selectors support
+Complex pods and nodes views (with CPU/MEM percentages)
+CPU/MEM percentages have thresholds and respective faces
+*** Behaviour
+Add unmark-item-backward command
+Add automatic movement for unmarking
+Show filter on the modeline, labels and field selectors in the buffer name
+Default to case-insensitive search when filtering
+
+*** Fixes
+Fixed error when showing rollout revisions (kubel--show-rollout-revision passes correct callback)
+Describe resource doesn't use kubel-yaml-mode anymore
+*** Other
+*** Problems
+I don't use eat so can't test
+
+* Fix annoying errors if no resources
+* Add custom default namespace
+https://github.com/abrochard/kubel/pull/150
+* Add nodeshell capabilities
+* change the keybindings so n, p, sorting is available
+* does kubel need its own kubel-yaml-editing-mode?
+* kubel-delete-resource can delete in batches as soon as the resources are in the same namespace
+* cache everything that make sense to
+api resources lists, global resources lists, namespaces, etc
+
+Make a single function to nuke global state
+* DONE instead of popping buffer for every kubel--exec, accumulate all kubectl output to a single buffer
+CLOSED: [2025-09-25 Thu 16:59]
+* add a command to apply any yaml/json to k8s
+** add kubel-global-context, kubel-global-namespace
+* add simple and complex views for pods and nodes
+** accumulate several kubectl calls into a number of hashtables (ns.name)->ht
+** merge hashtables in an intelligent way
+** convert hashtables to alists
+* test plan
+- [ ] get resource details view
+- [ ] get resource details apply
+- [ ] C-u get resource details (describe)
+- [ ]
+* commands
+** global
+get details, switch to buffer, mark, unmark, sort, next/prev highlight, help
+RET, b m u M U DEL s, M-n, M-p ? h
+** configure c
+context, namespace, resource type, config file
+c n r f
+** format/filtering/selectors f
+complex, output (yaml/json), regex, field, label
+c, o, r, f, l
+** resource r
+jab, rollout history, exec, scale, port-forward, log, delete
+j r e s p l k
+** jump j
+owner, child, node
+o c n
+** copy w
