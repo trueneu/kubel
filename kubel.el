@@ -313,14 +313,19 @@ This is used by `kubel-kill-buffer'."
 (defvar kubel--internal-type-ownership-alist
   '((deployments . pods)
     (replicasets . pods)
-    (daemonsets . pods)))
+    (daemonsets . pods)
+    (cronjobs . jobs))
+  "Maps a resource type to its children.")
 
 ;; TODO fill this in
 (defvar kubel--internal-type-resource-type-alias-alist
   '((deployments . ("Deployments" "deployments" "deployments.apps"))
     (replicasets . ("ReplicaSets" "replicasets" "replicasets.apps"))
     (daemonsets . ("DaemonSets" "daemonsets" "daemonsets.apps"))
-    (pods . ("Pods" "pods"))))
+    (pods . ("Pods" "pods"))
+    (jobs . ("Jobs" "jobs" "jobs.batch"))
+    (cronjobs . ("CronJobs" "cronjobs" "cronjobs.batch")))
+  "Maps a resource type to a list of possible API resource type names.")
 
 ;; TODO fill this in
 (defvar kubel--resource-type-singular->plural-ht
@@ -329,7 +334,12 @@ This is used by `kubel-kill-buffer'."
       ("ReplicaSet" "ReplicaSets")
       ("replicaset" "replicasets")
       ("DaemonSet" "DaemonSets")
-      ("daemonset" "daemonsets")))
+      ("daemonset" "daemonsets")
+      ("CronJob" "CronJobs")
+      ("cronjob" "cronjobs")
+      ("Job" "Jobs")
+      ("job" "jobs"))
+  "Maps a singular resource type to plural.")
 
 (defvar kubel--resource-type->aliases-ht
   (let ((result (ht)))
@@ -378,6 +388,12 @@ CMD is the command string to run."
   (replace-regexp-in-string
    "\n" "" (kubel--exec-to-string "kubectl config current-context"))
   "Current context.  Tries to smart default.")
+
+(defvar kubel--last-context nil
+  "Last used context.")
+
+(defvar kubel--last-namespace nil
+  "Last used namespace.")
 
 (defvar-local kubel-resource-filter ""
   "Regex filter for resource view.")
@@ -496,8 +512,8 @@ from k8s point of view to avoid clashes.")
                                                                                         "/"
                                                                                         mem-lim-str
                                                                                         ")"))))))))
-                                 ("nodes" `((table-columns . ("NAME" "STATUS" "ROLES" "CPU" "MEM" "AGE"))
-                                            (calls . (((type . get))
+                                 ("nodes" `((table-columns . ("NAME" "STATUS" "ROLES" "CPU" "MEM" "INTERNAL-IP" "EXTERNAL-IP" "AGE"))
+                                            (calls . (((type . get-wide))
                                                       ((type . custom)
                                                        (spec . "NAME:.metadata.name,CPUALLOC:.status.allocatable.cpu,MEMALLOC:.status.allocatable.memory"))
                                                       ((type . top))))
@@ -531,7 +547,12 @@ from k8s point of view to avoid clashes.")
                                                                                       (kubel--ratio
                                                                                        (kubel--convert-size-units-bytes mem-usage-str)
                                                                                        (kubel--convert-size-units-bytes mem-alloc-str))
-                                                                                      ")")))))))))
+                                                                                      ")"))))))))
+                                 ("events" `((table-columns . ("NAME" "LAST SEEN" "TYPE" "REASON" "OBJECT" "SUBOBJECT" "MESSAGE"))
+                                             (calls . (((type . get-wide))
+                                                       ((type . custom)
+                                                        (spec . "NAMESPACE:.metadata.namespace,NAME:.metadata.name")))))))
+
   "The structure to define complex resource type views (i.e. consisting
 more than one kubectl get call).
 
@@ -569,7 +590,7 @@ results.
 jsonpath call has spec and columns keys. spec is the jsonpath for
 kubectl call, and columns are names for the values from the call. All
 values in jsonpath must be divided by a single whitespace, with
-NAMESPACE and NAME appearing first.
+NAMESPACE (if applicable) and NAME appearing first.
 
 jsonpath-repeated-columns has spec, static-columns, repeated-columns,
 pre-process and post-process fields. spec is as above, static-columns
@@ -583,10 +604,11 @@ of one for post-process. For pre-process, functions will be called with
 first argument as an accumulator (integer), and second as a literal
 value of a given column (string), for each repeated column. For
 post-process, each function will be called once to form the final value
-of the column after the call.
+of the column after the call. Post-process function must return a
+string.
 
 Global post-process entry (per resource-type) defines any final
-transformations that apply to entries before displaying the table. it
+transformations that apply to entries before displaying the table. It
 contains a single function as a value, that will get a hashtable of each
 entry as an argument. You can use this to define new columns, or alter
 existing ones.
@@ -708,7 +730,8 @@ invisible ones to the minimum)."
         (kubel--exec-to-string (concat (kubel--kubectl-prefix kubel-namespace)
                                        " get " kubel-resource-type (kubel--kubectl-suffix))))
     (let* ((call-spec (ht-get kubel--complex-views kubel-resource-type))
-           (table-columns (append (if (kubel--all-namespaces?) '("NAMESPACE"))
+           (table-columns (append (if (and (kubel--all-namespaces?)
+                                           (not (kubel--resource-type-global? kubel-resource-type))) '("NAMESPACE"))
                                   (asoc-get call-spec 'table-columns)))
            (post-process-fns (asoc-get call-spec 'post-process))
            (calls (asoc-get call-spec 'calls))
@@ -731,6 +754,7 @@ invisible ones to the minimum)."
                         (parsed (kubel--parse-body body))
                         (hashtable (kubel--parsed-body-to-ns-name-ht parsed)))
                    (setq res hashtable)))
+                ;; TODO: instead of top, maybe call to metrics.k8s.io resources?
                 ((eq type 'top)
                  (let* ((kubel-list-wide nil)
                         (body (kubel--exec-to-string (concat (kubel--kubectl-prefix kubel-namespace)
@@ -784,6 +808,7 @@ invisible ones to the minimum)."
                    (dolist (ns-name (ht-keys hashtable))
                      (when (ht-contains? res ns-name)
                        (ht-set res ns-name (ht-merge (ht-get res ns-name) (ht-get hashtable ns-name))))))))))
+      (message "%s" table-columns)
       (append
        (list table-columns)
        (mapcar
@@ -793,7 +818,7 @@ invisible ones to the minimum)."
           (mapcar
            (lambda (column) (ht-get entry-ht column))
            table-columns))
-        (ht-values res))))))
+        (reverse (ht-values res)))))))
 
 (comment
  (let ((kubel-resource-type "pods")
@@ -1495,11 +1520,15 @@ TYPENAME is the resource type/name."
         (rollouts (kubel--list-rollout typename ns)))
     (completing-read prompt rollouts)))
 
-(defun kubel--is-pod-view ()
+(defun kubel--pod-view? ()
   "Return non-nil if this is the pod view."
   (equal (capitalize kubel-resource-type) "Pods"))
 
-(defun kubel--is-deployment-view ()
+(defun kubel--node-view? ()
+  "Return non-nil if this is the pod view."
+  (equal (capitalize kubel-resource-type) "Nodes"))
+
+(defun kubel--deployment-view? ()
   "Return non-nil if this is a deployment view."
   (-contains? '("Deployments" "deployments" "deployments.apps") kubel-resource-type))
 
@@ -1507,7 +1536,7 @@ TYPENAME is the resource type/name."
 (defun kubel--is-scalable ()
   "Return non-nil if the resource can be scaled."
   (or
-   (kubel--is-deployment-view)
+   (kubel--deployment-view?)
    (-contains? '("ReplicaSets" "replicasets" "replicasets.apps") kubel-resource-type)
    (-contains? '("StatefulSets" "statefulsets" "statefulsets.apps") kubel-resource-type)))
 
@@ -1549,9 +1578,9 @@ Allows simple apply of the changes made.
 
 \\{kubel-json-editing-mode-map}")
 
-(defun kubel-apply ()
+(defun kubel-apply (&optional no-prompt)
   "Save the current buffer to a temp file and try to kubectl apply it."
-  (interactive)
+  (interactive "P")
   (setq dir-prefix (or
                     (when (tramp-tramp-file-p default-directory)
                       (with-parsed-tramp-file-name default-directory nil
@@ -1565,7 +1594,7 @@ Allows simple apply of the changes made.
                                                 (cond ((eq major-mode 'kubel-yaml-editing-mode) "yaml")
                                                       ((eq major-mode 'kubel-json-editing-mode) "json"))))
          (filename (format "%s%s" dir-prefix filename-without-tramp-prefix)))
-    (when (y-or-n-p "Apply the changes? ")
+    (when (or no-prompt (y-or-n-p "Apply the changes? "))
       (unless  (file-exists-p (format "%s/tmp/kubel" dir-prefix))
         (make-directory (format "%s/tmp/kubel" dir-prefix) t))
       (write-region (point-min) (point-max) filename)
@@ -1627,7 +1656,7 @@ ARGS is the arguments list from transient.
 TYPE is containers or initContainers."
   (interactive
    (list (transient-args 'kubel-log-popup)))
-  (dolist (pod (if (kubel--is-pod-view)
+  (dolist (pod (if (kubel--pod-view?)
                    (if (kubel--items-selected?)
                        (ht-keys kubel--selected-items-set)
                      (list (kubel--get-ns-name-under-cursor)))
@@ -1676,7 +1705,7 @@ ARGS is the arguments list from transient."
   "Copy the streaming log command of the pod under the cursor."
   (interactive)
   (kill-new
-   (let* ((cell (if (kubel--is-pod-view)
+   (let* ((cell (if (kubel--pod-view?)
                     (kubel--get-ns-name-under-cursor)
                   (kubel--select-resource "Pods")))
           (ns (car cell))
@@ -1860,7 +1889,7 @@ the context caches, including the cached resource list."
 P can be a single number or a localhost:container port pair."
   (interactive "sPort: ")
   (let* ((port (if (string-match-p ":" p) p (format "%s:%s" p p)))
-         (cell (if (kubel--is-pod-view)
+         (cell (if (kubel--pod-view?)
                    (kubel--get-ns-name-under-cursor)
                  (kubel--select-resource "Pods")))
          (ns (car cell))
@@ -1882,7 +1911,7 @@ P can be a single number or a localhost:container port pair."
 ;; TODO: maybe redefine it to (ns . (pod . container)), simplify
 (defun kubel--get-container-under-cursor ()
   "Get `(container . pod)' name under cursor."
-  (let* ((cell (if (kubel--is-pod-view)
+  (let* ((cell (if (kubel--pod-view?)
                    (kubel--get-ns-name-under-cursor)
                  (kubel--select-resource "Pods")))
          (ns (car cell))
@@ -2025,7 +2054,7 @@ the variables `kubel-namespace' and `kubel-context', respectively."
 
 See https://github.com/kubernetes/kubernetes/issues/27081"
   (interactive)
-  (dolist (deployment (if (kubel--is-deployment-view)
+  (dolist (deployment (if (kubel--deployment-view?)
                           (if (kubel--items-selected?)
                               (ht-keys kubel--selected-items-set)
                             (list (kubel--get-ns-name-under-cursor)))
@@ -2207,21 +2236,23 @@ NAME is object's name."
          (name (cdr ns-name))
          (json-object (json-parse-string (kubel--exec-to-string (format "%s --context %s --namespace %s get %s %s -o json"
                                                                         kubel-kubectl kubel-context ns kubel-resource-type name))))
-         (owner-reference (aref (ht-get* json-object "metadata" "ownerReferences") 0))
-         (owner-kind (ht-get owner-reference "kind"))
-         (owner-name (ht-get owner-reference "name"))
-         (owner-kind-plural (ht-get kubel--resource-type-singular->plural-ht owner-kind))
-         (owner-kind-actual (kubel--find-resource-type-alias owner-kind-plural)))
-    (if (null owner-reference)
+         (json-owner-references (ht-get* json-object "metadata" "ownerReferences")))
+    (if (null json-owner-references)
         (message "Object has no owner.")
-      (with-current-buffer (clone-buffer)
-        (setq kubel-resource-type owner-kind-actual)
-        (kubel--select-only ns owner-name)
-        (setq kubel-selectors '())
-        (switch-to-buffer (current-buffer))
-        (kubel-refresh)
-        ;; set the cursor to the marked line
-        (forward-line -1)))))
+      (let* ((owner-reference (aref (ht-get* json-object "metadata" "ownerReferences") 0))
+             (owner-kind (ht-get owner-reference "kind"))
+             (owner-name (ht-get owner-reference "name"))
+             (owner-kind-plural (ht-get kubel--resource-type-singular->plural-ht owner-kind))
+             (owner-kind-actual (kubel--find-resource-type-alias owner-kind-plural)))
+        (with-current-buffer (clone-buffer)
+          (setq kubel-resource-type owner-kind-actual)
+          (kubel--select-only ns owner-name)
+          (setq kubel-selectors '())
+          (setq kubel-field-selectors "")
+          (switch-to-buffer (current-buffer))
+          (kubel-refresh)
+          ;; set the cursor to the marked line
+          (search-forward "*"))))))
 
 (defun kubel-jump-to-children ()
   (interactive)
@@ -2239,22 +2270,26 @@ NAME is object's name."
                 (name (cdr ns-name))
                 (json-object (json-parse-string (kubel--exec-to-string (format "%s --context %s --namespace %s get %s %s -o json"
                                                                                kubel-kubectl kubel-context ns kubel-resource-type name))))
-                (owner-match-labels (ht-get* json-object "spec" "selector" "matchLabels"))
-                (owner-kind-plural kubel-resource-type)
-                (owner-kind-internal (ht-get kubel--resource-type->internal-type-ht owner-kind-plural))
-                (child-kind-internal (asoc-get kubel--internal-type-ownership-alist owner-kind-internal))
-                (child-kind-alias (car (asoc-get kubel--internal-type-resource-type-alias-alist child-kind-internal)))
-                (child-kind-actual (kubel--find-resource-type-alias child-kind-alias)))
-           (with-current-buffer (clone-buffer)
-             (setq kubel-resource-type child-kind-actual)
-             (setq kubel-selectors (mapcar (lambda (label-value) (format "%s=%s" (car label-value) (cadr label-value)))
-                                           (ht-items owner-match-labels)))
-             (switch-to-buffer (current-buffer))
-             (kubel-refresh))))))
+                (owner-selector (ht-get* json-object "spec" "selector")))
+           (if (null owner-selector)
+               (error "Object has no children.")
+             (let* ((owner-match-labels (ht-get* json-object "spec" "selector" "matchLabels"))
+                    (owner-kind-plural kubel-resource-type)
+                    (owner-kind-internal (ht-get kubel--resource-type->internal-type-ht owner-kind-plural))
+                    (child-kind-internal (asoc-get kubel--internal-type-ownership-alist owner-kind-internal))
+                    (child-kind-alias (car (asoc-get kubel--internal-type-resource-type-alias-alist child-kind-internal)))
+                    (child-kind-actual (kubel--find-resource-type-alias child-kind-alias)))
+               (with-current-buffer (clone-buffer)
+                 (setq kubel-resource-type child-kind-actual)
+                 (setq kubel-selectors (mapcar (lambda (label-value) (format "%s=%s" (car label-value) (cadr label-value)))
+                                               (ht-items owner-match-labels)))
+                 (setq kubel-field-selectors "")
+                 (switch-to-buffer (current-buffer))
+                 (kubel-refresh))))))))
 
 (defun kubel-jump-to-node ()
   (interactive)
-  (if (not (kubel--is-pod-view))
+  (if (not (kubel--pod-view?))
       (error "Not in the pod view.")
     (let* ((ns-name (kubel--get-ns-name-under-cursor))
            (ns (car ns-name))
@@ -2268,6 +2303,13 @@ NAME is object's name."
         (setq kubel-field-selectors (concat "metadata.name=" node-name))
         (switch-to-buffer (current-buffer))
         (kubel-refresh)))))
+
+;; shell magic has to happen here
+(defun kubel-node-shell ()
+  (interactive)
+  (if (not (kubel--node-view?))
+      (error "Not in a node view.")
+    (error "Not implemented.")))
 
 ;; popups
 
@@ -2308,7 +2350,8 @@ NAME is object's name."
    ("s" "Scale" kubel-scale-replicas)
    ("p" "Port forward" kubel-port-forward-pod)
    ("l" "Logs" kubel-log-popup)
-   ("k" "Delete" kubel-delete-popup)])
+   ("k" "Delete" kubel-delete-popup)
+   ("n" "Node-shell" kubel-node-shell)])
 
 (transient-define-prefix kubel-jump-popup ()
   "Kubel Jump Menu"
@@ -2501,6 +2544,8 @@ DIRECTORY is optional for TRAMP support."
       (forward-line (1- line-num))))
   (when kubel--last-column-sorted
     (tabulated-list-sort kubel--last-column-sorted))
+  (setq kubel--last-context kubel-context)
+  (setq kubel--last-namespace kubel-namespace)
   (unless no-refresh
     (kubel--current-state)))
 
@@ -2539,6 +2584,19 @@ DIRECTORY is optional for TRAMP support."
       (unless (eq major-mode 'kubel-mode)
         (kubel-mode))
       (kubel-refresh nil directory))))
+
+;;;###autoload
+(defun kubel-apply-arbitrary (&optional no-prompt)
+  "Apply an arbitrary resource to last used context and namespace."
+  (interactive "P")
+  (if (or (null kubel--last-context)
+          (null kubel--last-namespace))
+      (error "You have to refresh at least one kubel buffer first.")
+    (let ((kubel-context kubel--last-context)
+          (kubel-namespace kubel--last-namespace))
+      (when (or no-prompt (y-or-n-p (format "Apply to ctx %s, ns %s? " kubel-context kubel-namespace)))
+        (let ((current-prefix-arg t))
+          (call-interactively #'kubel-apply))))))
 
 (define-derived-mode kubel-mode tabulated-list-mode "Kubel"
   "Special mode for kubel buffers."

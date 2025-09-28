@@ -1,11 +1,18 @@
-* Customize columns in resources view
-* Filtering by arbitrary fields (to enable pod filtered by nodename)
-* Jump to children
+* DONE Customize columns in resources view
+CLOSED: [2025-09-28 Sun 18:29]
+* DONE Filtering by arbitrary fields (to enable pod filtered by nodename)
+CLOSED: [2025-09-28 Sun 18:29]
+* DONE Jump to children
+CLOSED: [2025-09-28 Sun 18:30]
 Trees of resources: deployments -> replicasets, replicasets -> pods, services -> pods by selector, etc
-* Jump to owner
-* Jump to node from pod view
-* Sorting by arbitrary columns
-* Option for filtering not to gray out things but hide them completely
+* DONE Jump to owner
+CLOSED: [2025-09-28 Sun 18:30]
+* DONE Jump to node from pod view
+CLOSED: [2025-09-28 Sun 18:30]
+* DONE Sorting by arbitrary columns
+CLOSED: [2025-09-28 Sun 18:30]
+* DONE Option for filtering not to gray out things but hide them completely
+CLOSED: [2025-09-28 Sun 18:30]
 * All namespaces option
 See https://github.com/linktohack/kubel/commit/bdf20c1077dad697be0ddda99455739cb08788be
 (https://github.com/abrochard/kubel/issues/111)
@@ -104,27 +111,32 @@ Jump to owner
 Jump to node's pods
 Multiple label selectors support
 Field selectors support
-Complex pods and nodes views (with CPU/MEM percentages)
+Complex views support (for multiple kubectl calls and output re-arranging)
+Pods, nodes views (with CPU/MEM percentages)
+Events view
 CPU/MEM percentages have thresholds and respective faces
+Apply from anywhere
 *** Behaviour
+Remapped keyboard to avoid overload
 Add unmark-item-backward command
 Add automatic movement for unmarking
 Show filter on the modeline, labels and field selectors in the buffer name
 Default to case-insensitive search when filtering
-
 *** Fixes
 Fixed error when showing rollout revisions (kubel--show-rollout-revision passes correct callback)
 Describe resource doesn't use kubel-yaml-mode anymore
 *** Other
 *** Problems
-I don't use eat so can't test
-
 * Fix annoying errors if no resources
 * Add custom default namespace
 https://github.com/abrochard/kubel/pull/150
 * Add nodeshell capabilities
-* change the keybindings so n, p, sorting is available
-* does kubel need its own kubel-yaml-editing-mode?
+* Add debug container capabilities
+* Add view containers from pods
+* DONE change the keybindings so n, p, sorting is available
+CLOSED: [2025-09-28 Sun 18:30]
+* DONE does kubel need its own kubel-yaml-editing-mode?
+CLOSED: [2025-09-28 Sun 18:30]
 * kubel-delete-resource can delete in batches as soon as the resources are in the same namespace
 * cache everything that make sense to
 api resources lists, global resources lists, namespaces, etc
@@ -132,9 +144,11 @@ api resources lists, global resources lists, namespaces, etc
 Make a single function to nuke global state
 * DONE instead of popping buffer for every kubel--exec, accumulate all kubectl output to a single buffer
 CLOSED: [2025-09-25 Thu 16:59]
-* add a command to apply any yaml/json to k8s
+* DONE add a command to apply any yaml/json to k8s
+CLOSED: [2025-09-28 Sun 19:00]
 ** add kubel-global-context, kubel-global-namespace
-* add simple and complex views for pods and nodes
+* DONE add simple and complex views for pods and nodes
+CLOSED: [2025-09-28 Sun 19:17]
 ** accumulate several kubectl calls into a number of hashtables (ns.name)->ht
 ** merge hashtables in an intelligent way
 ** convert hashtables to alists
