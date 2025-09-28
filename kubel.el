@@ -663,10 +663,16 @@ Default is pop. See `kubel--exec'.")
 (defvar-local kubel--last-column-sorted nil
   "If not nil, sort by this column after refresh.")
 
+(defvar-local kubel--last-column-sorted-direction nil
+  "If t, sorted descending. If nil, ascending.")
+
 (defun kubel-sort-by-column-at-point ()
   (interactive)
   (let* ((colname (get-text-property (point) 'tabulated-list-column-name))
          (colnum (tabulated-list--column-number colname)))
+    (if (and (numberp kubel--last-column-sorted) (= colnum kubel--last-column-sorted))
+        (setq kubel--last-column-sorted-direction (not kubel--last-column-sorted-direction))
+      (setq kubel--last-column-sorted-direction nil))
     (setq kubel--last-column-sorted colnum)
     (tabulated-list-sort colnum)))
 
@@ -2572,7 +2578,10 @@ DIRECTORY is optional for TRAMP support."
       (forward-line (1- line-num))))
   (when (or (and kubel--no-reset-sort-column kubel--last-column-sorted)
             (called-interactively-p 'interactive))
-    (tabulated-list-sort kubel--last-column-sorted))
+    (tabulated-list-sort kubel--last-column-sorted)
+    (if kubel--last-column-sorted-direction
+        (tabulated-list-sort kubel--last-column-sorted)))
+  ;; TODO: stuff resets the colnum
   (unless kubel--no-reset-sort-column
     (setq kubel--last-column-sorted nil))
   (setq kubel--no-reset-sort-column nil)
