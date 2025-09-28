@@ -708,6 +708,35 @@ Default is pop. See `kubel--exec'.")
      entries)
     res))
 
+(defun kubel--merge-hts (main other)
+  "Utility function to merge two hashtables without creating a third one.
+
+MAIN is the hashtable to be mutated.
+OTHER is the one merged in."
+  (dolist (item (ht-items other))
+    (let ((key (car item))
+          (value (cadr item)))
+      (ht-set main key value))))
+
+(defun kubel--merge-second-order-hts (main other)
+  "Utility function to merge two second-order hashtables without creating a third one.
+
+MAIN is the hashtable to be mutated.
+OTHER is the one merged in."
+  (dolist (item (ht-items other))
+    (let ((key (car item))
+          (value (cadr item)))
+      (when (ht-contains? main key)
+        (kubel--merge-hts (ht-get main key) value)))))
+
+(comment
+ (let ((ht1 (ht (1 (ht ('a 'b)))))
+       (ht2 (ht (1 (ht ('c 'd)))
+                (2 (ht ('e 'f))))))
+   (kubel--merge-second-order-hts ht2 ht1)
+   ht2))
+
+
 (defun kubel--make-view-calls ()
   "A function to make all the calls needed to form the view. Returns a list
 properly formatted for future display in tabulated-list-mode.
@@ -773,11 +802,7 @@ invisible ones to the minimum)."
                                                              (kubel--kubectl-suffix))))
                         (parsed (kubel--parse-body body))
                         (hashtable (kubel--parsed-body-to-ns-name-ht parsed)))
-                   (dolist (ns-name (ht-keys hashtable))
-                     ;; if resource appeared between the calls
-                     ;; TODO: generalize this bit
-                     (when (ht-contains? res ns-name)
-                       (ht-set res ns-name (ht-merge (ht-get res ns-name) (ht-get hashtable ns-name)))))))
+                   (kubel--merge-second-order-hts res hashtable)))
                 ((eq type 'jsonpath)
                  (let* ((kubel-list-wide nil)
                         (spec (asoc-get call 'spec))
@@ -788,9 +813,7 @@ invisible ones to the minimum)."
                                                              (kubel--kubectl-suffix))))
                         (parsed (kubel--parse-jsonpath-body body columns))
                         (hashtable (kubel--parsed-body-to-ns-name-ht parsed)))
-                   (dolist (ns-name (ht-keys hashtable))
-                     (when (ht-contains? res ns-name)
-                       (ht-set res ns-name (ht-merge (ht-get res ns-name) (ht-get hashtable ns-name)))))))
+                   (kubel--merge-second-order-hts res hashtable)))
                 ((eq type 'jsonpath-repeated-columns)
                  (let* ((kubel-list-wide nil)
                         (spec (asoc-get call 'spec))
@@ -805,9 +828,7 @@ invisible ones to the minimum)."
                         (parsed (kubel--parse-jsonpath-repeated-columns-body
                                  body static-columns repeated-columns pre-process-alist post-process-alist))
                         (hashtable (kubel--parsed-body-to-ns-name-ht parsed)))
-                   (dolist (ns-name (ht-keys hashtable))
-                     (when (ht-contains? res ns-name)
-                       (ht-set res ns-name (ht-merge (ht-get res ns-name) (ht-get hashtable ns-name))))))))))
+                   (kubel--merge-second-order-hts res hashtable))))))
       (message "%s" table-columns)
       (append
        (list table-columns)
@@ -1598,7 +1619,10 @@ Allows simple apply of the changes made.
       (unless  (file-exists-p (format "%s/tmp/kubel" dir-prefix))
         (make-directory (format "%s/tmp/kubel" dir-prefix) t))
       (write-region (point-min) (point-max) filename)
-      (kubel--exec (format "kubectl - apply - %s" filename) nil 'apply (list "apply" "-f" filename-without-tramp-prefix) nil (lambda () (message "Applied %s" filename))))))
+      (kubel--exec (format "kubectl - apply - %s" filename)
+                   (if (kubel--all-namespaces?) nil kubel-namespace)
+                   'apply (list "apply" "-f" filename-without-tramp-prefix)
+                   nil (lambda () (message "Applied %s" filename))))))
 
 (defun kubel-get-object-details (&optional describe)
   "Get the details of the object under the cursor.
