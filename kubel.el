@@ -1868,6 +1868,7 @@ the context caches, including the cached resource list."
     (kubel--add-selector-to-history kubel-selectors)
     ;; Update pod list according to the label selector
     (switch-to-buffer (current-buffer))
+    (setq kubel--no-reset-sort-column t)
     (kubel-refresh)))
 
 (defun kubel-set-field-selector ()
@@ -2110,6 +2111,7 @@ REPLICAS is the number of desired replicas."
   "Set the view filter."
   (interactive)
   (setq kubel-resource-filter (read-string "Filter: " kubel-resource-filter))
+  (setq kubel--no-reset-sort-column t)
   (kubel-refresh))
 
 (defun kubel--jump-to-highlight (init search reset)
@@ -2531,6 +2533,8 @@ Append filter to the modeline."
           (ht-set kubel--global-resources-set-cached entry t))))
   kubel--global-resources-set-cached)
 
+(defvar-local kubel--no-reset-sort-column nil)
+
 ;;;###autoload
 (defun kubel-refresh (&optional no-refresh directory)
   "Refresh the current kubel buffer, calling kubectl using the configured
@@ -2566,8 +2570,13 @@ DIRECTORY is optional for TRAMP support."
       ;; keeping the same line.
       (goto-char (point-min))
       (forward-line (1- line-num))))
-  (when kubel--last-column-sorted
+  (when (or (and kubel--no-reset-sort-column kubel--last-column-sorted)
+            (called-interactively-p 'interactive))
     (tabulated-list-sort kubel--last-column-sorted))
+  (unless kubel--no-reset-sort-column
+    (setq kubel--last-column-sorted nil))
+  (setq kubel--no-reset-sort-column nil)
+  ;; TODO: should be memorising sort direction as well it seems
   (setq kubel--last-context kubel-context)
   (setq kubel--last-namespace kubel-namespace)
   (unless no-refresh
