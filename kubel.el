@@ -314,7 +314,8 @@ This is used by `kubel-kill-buffer'."
   '((deployments . pods)
     (replicasets . pods)
     (daemonsets . pods)
-    (cronjobs . jobs))
+    (cronjobs . jobs)
+    (statetfulsets . pods))
   "Maps a resource type to its children.")
 
 ;; TODO fill this in
@@ -324,7 +325,8 @@ This is used by `kubel-kill-buffer'."
     (daemonsets . ("DaemonSets" "daemonsets" "daemonsets.apps"))
     (pods . ("Pods" "pods"))
     (jobs . ("Jobs" "jobs" "jobs.batch"))
-    (cronjobs . ("CronJobs" "cronjobs" "cronjobs.batch")))
+    (cronjobs . ("CronJobs" "cronjobs" "cronjobs.batch"))
+    (statefulsets . ("StatefulSets" "statefulsets" "statefulsets.apps")))
   "Maps a resource type to a list of possible API resource type names.")
 
 ;; TODO fill this in
@@ -338,7 +340,9 @@ This is used by `kubel-kill-buffer'."
       ("CronJob" "CronJobs")
       ("cronjob" "cronjobs")
       ("Job" "Jobs")
-      ("job" "jobs"))
+      ("job" "jobs")
+      ("StatefulSet" "StatefulSets")
+      ("statefulset" "statefulsets"))
   "Maps a singular resource type to plural.")
 
 (defvar kubel--resource-type->aliases-ht
@@ -354,6 +358,8 @@ This is used by `kubel-kill-buffer'."
     (dolist (aliases kubel--internal-type-resource-type-alias-alist result)
       (dolist (alias (cdr aliases))
         (ht-set result alias (car aliases))))))
+
+;; TODO: find a way to make it universal?
 
 (defvar-local kubel--last-parent nil)
 
@@ -1035,7 +1041,29 @@ NO-REFRESH inhibits running kubectl."
              nil)
             (t
              (< perc1
-              perc2))))))
+                perc2))))))
+
+;; TODO: add descriptions; make a mechanism to choose between these functions.
+(defun kubel--get-count-restarts (s)
+  (if (s-equals? "0" s)
+      0
+    (when (string-match (rx bol (group (one-or-more digit)) (group " (" (* anything) " ago)") eol) s)
+      (string-to-number (match-string 1 s)))))
+
+(defun kubel--get-last-restart-age (s)
+  (if (s-equals? "0" s)
+      0
+    (when (string-match (rx bol (group (one-or-more digit)) " (" (group (* anything)) " ago)" eol) s)
+      (kubel--age-to-secs (match-string 2 s)))))
+
+(defun kubel--make-restarts-comparator (colnum)
+  "Return a function that compares number of restarts."
+  (lambda (row1 row2)
+    (let* ((restarts1 (elt (cadr row1) colnum))
+           (restarts2 (elt (cadr row2) colnum))
+           (age1 (kubel--get-last-restart-age restarts1))
+           (age2 (kubel--get-last-restart-age restarts2)))
+      (< age1 age2))))
 
 (defun kubel--column-entry (entrylist)
   "Return a function of colnum to retrieve an entry in a given column for
@@ -1049,6 +1077,8 @@ ENTRYLIST."
                     (kubel--make-resource-usage-comparator colnum))
                    ((member name '("AGE" "DURATION" "LAST SCHEDULE"))
                     (kubel--make-age-comparator colnum))
+                   ((member name '("RESTARTS"))
+                    (kubel--make-restarts-comparator colnum))
                    (t t))))
        (list name width sort)))))
 
@@ -2118,7 +2148,7 @@ REPLICAS is the number of desired replicas."
   (interactive)
   (setq kubel-resource-filter (read-string "Filter: " kubel-resource-filter))
   (setq kubel--no-reset-sort-column t)
-  (kubel-refresh))
+  (kubel-refresh t))
 
 (defun kubel--jump-to-highlight (init search reset)
   "Base function to jump to highlight.
@@ -2276,6 +2306,7 @@ NAME is object's name."
              (owner-name (ht-get owner-reference "name"))
              (owner-kind-plural (ht-get kubel--resource-type-singular->plural-ht owner-kind))
              (owner-kind-actual (kubel--find-resource-type-alias owner-kind-plural)))
+        (message "owner: %s" owner-kind-actual)
         (with-current-buffer (clone-buffer)
           (setq kubel-resource-type owner-kind-actual)
           (kubel--select-only ns owner-name)
@@ -2582,10 +2613,11 @@ DIRECTORY is optional for TRAMP support."
     (if kubel--last-column-sorted-direction
         (tabulated-list-sort kubel--last-column-sorted)))
   ;; TODO: stuff resets the colnum
-  (unless kubel--no-reset-sort-column
-    (setq kubel--last-column-sorted nil))
+  (when (and (not kubel--no-reset-sort-column)
+             (not (called-interactively-p 'interactive)))
+    (setq kubel--last-column-sorted nil)
+    (setq kubel--last-column-sorted-direction nil))
   (setq kubel--no-reset-sort-column nil)
-  ;; TODO: should be memorising sort direction as well it seems
   (setq kubel--last-context kubel-context)
   (setq kubel--last-namespace kubel-namespace)
   (unless no-refresh

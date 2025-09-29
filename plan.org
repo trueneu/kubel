@@ -152,6 +152,7 @@ CLOSED: [2025-09-28 Sun 19:17]
 ** accumulate several kubectl calls into a number of hashtables (ns.name)->ht
 ** merge hashtables in an intelligent way
 ** convert hashtables to alists
+* TODO logs command must work with --all-containers switch, and deployments/statefulsets etc
 * test plan
 - [ ] get resource details view
 - [ ] get resource details apply
