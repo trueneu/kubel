@@ -1051,13 +1051,13 @@ NO-REFRESH inhibits running kubectl."
       (string-to-number (match-string 1 s)))))
 
 (defun kubel--get-last-restart-age (s)
-  (if (s-equals? "0" s)
-      0
-    (when (string-match (rx bol (group (one-or-more digit)) " (" (group (* anything)) " ago)" eol) s)
-      (kubel--age-to-secs (match-string 2 s)))))
+  ;; if there's age, return that; else return effectively "never" (long in the past)
+  (if (string-match (rx bol (group (one-or-more digit)) " (" (group (* anything)) " ago)" eol) s)
+      (kubel--age-to-secs (match-string 2 s))
+    most-positive-fixnum))
 
 (defun kubel--make-restarts-comparator (colnum)
-  "Return a function that compares number of restarts."
+  "Return a function that compares age of last restarts."
   (lambda (row1 row2)
     (let* ((restarts1 (elt (cadr row1) colnum))
            (restarts2 (elt (cadr row2) colnum))
@@ -1659,6 +1659,30 @@ Allows simple apply of the changes made.
                    (if (kubel--all-namespaces?) nil kubel-namespace)
                    'apply (list "apply" "-f" filename-without-tramp-prefix)
                    nil (lambda () (message "Applied %s" filename))))))
+
+;; almost a full copy of kubel-apply above
+(defun kubel--delete ()
+  "Save the current buffer to a temp file and try to kubectl delete it."
+  (setq dir-prefix (or
+                    (when (tramp-tramp-file-p default-directory)
+                      (with-parsed-tramp-file-name default-directory nil
+                        (format "/%s%s:%s:" (or hop "") method (if user (concat user "@" host) host))))
+                    ""))
+
+  (let* ((filename-without-tramp-prefix (format "/tmp/kubel/%s-%s.%s"
+                                                (replace-regexp-in-string "/" "_"
+                                                                          (replace-regexp-in-string "\*\\| " "" (buffer-name)))
+                                                (floor (float-time))
+                                                (cond ((eq major-mode 'kubel-yaml-editing-mode) "yaml")
+                                                      ((eq major-mode 'kubel-json-editing-mode) "json"))))
+         (filename (format "%s%s" dir-prefix filename-without-tramp-prefix)))
+    (unless  (file-exists-p (format "%s/tmp/kubel" dir-prefix))
+      (make-directory (format "%s/tmp/kubel" dir-prefix) t))
+    (write-region (point-min) (point-max) filename)
+    (kubel--exec (format "kubectl - delete - %s" filename)
+                 (if (kubel--all-namespaces?) nil kubel-namespace)
+                 'apply (list "delete" "-f" filename-without-tramp-prefix)
+                 nil (lambda () (message "Applied %s" filename)))))
 
 (defun kubel-get-object-details (&optional describe)
   "Get the details of the object under the cursor.
@@ -2671,6 +2695,19 @@ DIRECTORY is optional for TRAMP support."
       (when (or no-prompt (y-or-n-p (format "Apply to ctx %s, ns %s? " kubel-context kubel-namespace)))
         (let ((current-prefix-arg t))
           (call-interactively #'kubel-apply))))))
+
+;;;###autoload
+(defun kubel-delete-arbitrary (&optional no-prompt)
+  "Delete an arbitrary resource from the last used context and namespace."
+  (interactive "P")
+  (if (or (null kubel--last-context)
+          (null kubel--last-namespace))
+      (error "You have to refresh at least one kubel buffer first.")
+    (let ((kubel-context kubel--last-context)
+          (kubel-namespace kubel--last-namespace))
+      (when (or no-prompt (y-or-n-p (format "Delete from ctx %s, ns %s? " kubel-context kubel-namespace)))
+        (let ((current-prefix-arg t))
+          (kubel--delete))))))
 
 (define-derived-mode kubel-mode tabulated-list-mode "Kubel"
   "Special mode for kubel buffers."
