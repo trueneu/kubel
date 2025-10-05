@@ -1635,9 +1635,10 @@ Allows simple apply of the changes made.
 
 \\{kubel-json-editing-mode-map}")
 
-(defun kubel-apply (&optional no-prompt)
-  "Save the current buffer to a temp file and try to kubectl apply it."
-  (interactive "P")
+(defun kubel--act-on-file (operation &optional no-prompt)
+  "Utility function to abstract kubectl operations on files.
+
+OPERATION is a string, a kubectl verb (apply, delete, etc)"
   (setq dir-prefix (or
                     (when (tramp-tramp-file-p default-directory)
                       (with-parsed-tramp-file-name default-directory nil
@@ -1651,38 +1652,24 @@ Allows simple apply of the changes made.
                                                 (cond ((eq major-mode 'kubel-yaml-editing-mode) "yaml")
                                                       ((eq major-mode 'kubel-json-editing-mode) "json"))))
          (filename (format "%s%s" dir-prefix filename-without-tramp-prefix)))
-    (when (or no-prompt (y-or-n-p "Apply the changes? "))
+    (when (or no-prompt (y-or-n-p (concat operation "? ")))
       (unless  (file-exists-p (format "%s/tmp/kubel" dir-prefix))
         (make-directory (format "%s/tmp/kubel" dir-prefix) t))
       (write-region (point-min) (point-max) filename)
-      (kubel--exec (format "kubectl - apply - %s" filename)
+      (kubel--exec (format "kubectl - %s - %s" operation filename)
                    (if (kubel--all-namespaces?) nil kubel-namespace)
-                   'apply (list "apply" "-f" filename-without-tramp-prefix)
-                   nil (lambda () (message "Applied %s" filename))))))
+                   'apply (list operation "-f" filename-without-tramp-prefix)
+                   nil (lambda () (message "Executed %s on %s" operation filename))))))
 
-;; almost a full copy of kubel-apply above
+
+(defun kubel-apply (&optional no-prompt)
+  "Save the current buffer to a temp file and try to kubectl apply it."
+  (interactive "P")
+  (kubel--act-on-file "apply" no-prompt))
+
 (defun kubel--delete ()
   "Save the current buffer to a temp file and try to kubectl delete it."
-  (setq dir-prefix (or
-                    (when (tramp-tramp-file-p default-directory)
-                      (with-parsed-tramp-file-name default-directory nil
-                        (format "/%s%s:%s:" (or hop "") method (if user (concat user "@" host) host))))
-                    ""))
-
-  (let* ((filename-without-tramp-prefix (format "/tmp/kubel/%s-%s.%s"
-                                                (replace-regexp-in-string "/" "_"
-                                                                          (replace-regexp-in-string "\*\\| " "" (buffer-name)))
-                                                (floor (float-time))
-                                                (cond ((eq major-mode 'kubel-yaml-editing-mode) "yaml")
-                                                      ((eq major-mode 'kubel-json-editing-mode) "json"))))
-         (filename (format "%s%s" dir-prefix filename-without-tramp-prefix)))
-    (unless  (file-exists-p (format "%s/tmp/kubel" dir-prefix))
-      (make-directory (format "%s/tmp/kubel" dir-prefix) t))
-    (write-region (point-min) (point-max) filename)
-    (kubel--exec (format "kubectl - delete - %s" filename)
-                 (if (kubel--all-namespaces?) nil kubel-namespace)
-                 'apply (list "delete" "-f" filename-without-tramp-prefix)
-                 nil (lambda () (message "Applied %s" filename)))))
+  (kubel--act-on-file "delete" t))
 
 (defun kubel-get-object-details (&optional describe)
   "Get the details of the object under the cursor.
@@ -2694,7 +2681,7 @@ DIRECTORY is optional for TRAMP support."
           (kubel-namespace kubel--last-namespace))
       (when (or no-prompt (y-or-n-p (format "Apply to ctx %s, ns %s? " kubel-context kubel-namespace)))
         (let ((current-prefix-arg t))
-          (call-interactively #'kubel-apply))))))
+          (call-interactively #'kubel-apply t))))))
 
 ;;;###autoload
 (defun kubel-delete-arbitrary (&optional no-prompt)
