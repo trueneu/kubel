@@ -1720,6 +1720,10 @@ ARGS is the arguments list from transient."
 (defun kubel--follow-logs-mode? (args)
   (member "-f" args))
 
+;; TODO: rename from get-pod-logs to get-logs
+;; if in pod view, get pod under cursor / selected items
+;; if in deployment/rs/whatever else view, use kubectl logs deployments/blah form
+;;   if something is selected, refuse to work
 (defun kubel-get-pod-logs (&optional args type)
   "Get the last N logs of the pod under the cursor.
 

@@ -150,9 +150,13 @@ CLOSED: [2025-09-28 Sun 19:00]
 * DONE add simple and complex views for pods and nodes
 CLOSED: [2025-09-28 Sun 19:17]
 ** accumulate several kubectl calls into a number of hashtables (ns.name)->ht
-** merge hashtables in an intelligent way
-** convert hashtables to alists
+** DONE merge hashtables in an intelligent way
+CLOSED: [2025-10-10 Fri 14:06]
+** convert hashtables to alists (what's the performance?)
 * TODO logs command must work with --all-containers switch, and deployments/statefulsets etc
+* fetch resources list and namespaces list in async manner
+When? Right after changing the context?
+* fix modeline regex filter displayed in every modeline instead of current buffer
 * test plan
 - [ ] get resource details view
 - [ ] get resource details apply
