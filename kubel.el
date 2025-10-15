@@ -2537,11 +2537,12 @@ NAME is object's name."
 (defun kubel--current-state ()
   "Show the current context, namespace, and resource in the Echo Area.
 Append filter to the modeline."
-  (setq mode-line-misc-info
-        (mapconcat 'identity (append
-                              (unless (s-blank? kubel-resource-filter)
-                                (list (format "/%s" kubel-resource-filter))))
-                             " "))
+  (setq
+   mode-line-misc-info
+   (mapconcat 'identity (append
+                         (unless (s-blank? kubel-resource-filter)
+                           (list (format "/%s" kubel-resource-filter))))
+                        " "))
   (message (concat
             (format "[Context: %s] [Namespace: %s] [Resource: %s]" kubel-context kubel-namespace kubel-resource-type)
             (unless (and (kubel--empty? kubel-selectors) (s-blank? kubel-field-selectors))
@@ -2585,6 +2586,7 @@ Append filter to the modeline."
           (ht-set kubel--global-resources-set-cached entry t))))
   kubel--global-resources-set-cached)
 
+;; FIXME sometimes it wants to sort on nil column, reproduce
 (defvar-local kubel--no-reset-sort-column nil)
 
 ;;;###autoload
@@ -2635,8 +2637,10 @@ DIRECTORY is optional for TRAMP support."
   (setq kubel--no-reset-sort-column nil)
   (setq kubel--last-context kubel-context)
   (setq kubel--last-namespace kubel-namespace)
-  (unless no-refresh
-    (kubel--current-state)))
+  (kubel--current-state))
+  ;; FIXME maybe this was needed?
+  ;; (unless no-refresh
+  ;;   (kubel--current-state)))
 
 (defun toggle-kubel-filter-hides ()
   (interactive)
