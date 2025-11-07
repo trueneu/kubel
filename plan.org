@@ -154,7 +154,13 @@ CLOSED: [2025-09-28 Sun 19:17]
 CLOSED: [2025-10-10 Fri 14:06]
 ** convert hashtables to alists (what's the performance?)
 * TODO logs command must work with --all-containers switch, and deployments/statefulsets etc
-* fetch resources list and namespaces list in async manner
+* TODO namespace should not change when changing the context if exists in new context
+* TODO get/describe should work for multiple selected and visible resources, if any
+** check if get/apply with C-c C-c is possible in this manner
+* TODO selected resources should remain selected if changing resource/ctx
+** but no operations on invisible ones
+* TODO reset table sorting if no resources found
+* TODO fetch resources list and namespaces list in async manner
 When? Right after changing the context?
 * fix modeline regex filter displayed in every modeline instead of current buffer
 * test plan
