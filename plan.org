@@ -158,12 +158,14 @@ CLOSED: [2025-10-10 Fri 14:06]
 * TODO namespace should not change when changing the context if exists in new context
 * TODO get/describe should work for multiple selected and visible resources, if any
 ** check if get/apply with C-c C-c is possible in this manner
+* TODO arbitrary application by selected region
 * DONE selected resources should remain selected if changing resource/ctx
 CLOSED: [2025-11-07 Fri 01:35]
 ** but no operations on invisible ones
 * TODO reset table sorting if no resources found
 * TODO fetch resources list and namespaces list in async manner
 When? Right after changing the context?
+** renew them every X seconds maybe, otherwise if I create a namespace it's not visible
 * fix modeline regex filter displayed in every modeline instead of current buffer
 * test plan
 - [ ] get resource details view
