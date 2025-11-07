@@ -422,7 +422,11 @@ CMD is the command string to run."
 
 (defvar-local kubel--label-values-cached nil)
 
-(defvar-local kubel--selected-items-set (ht)
+;; FIXME: should this be local
+;; (defvar-local kubel--selected-items-set (ht)
+;;   "Hashet containing all the currently selected items.")
+
+(defvar kubel--selected-items-set (ht)
   "Hashet containing all the currently selected items.")
 
 (defvar-local kubel--kubernetes-api-resources-list-cached nil)
@@ -645,9 +649,14 @@ See also `kubel--make-view-calls'.
     (apply . accumulate)
     (patch . accumulate)
     (scale . accumulate)
-    (logs-follow . pop-comint))
+    (logs-follow . pop-comint)
+    (logs-multiple . accumulate)
+    (logs-follow-multiple . accumulate-comint))
+
   "Assoc list of operations to what to do with the operation results.
 Default is pop. See `kubel--exec'.")
+
+(defvar kubel--multiple-buffer-counter -1)
 
 (defun kubel--kubernetes-api-resources-list ()
   "Get list of resources from cache or from fetching the api resource."
@@ -741,13 +750,17 @@ OTHER is the one merged in."
       (when (ht-contains? main key)
         (kubel--merge-hts (ht-get main key) value)))))
 
-(comment
- (let ((ht1 (ht (1 (ht ('a 'b)))))
-       (ht2 (ht (1 (ht ('c 'd)))
-                (2 (ht ('e 'f))))))
-   (kubel--merge-second-order-hts ht2 ht1)
-   ht2))
+(defun kubel--set-intersection (ht1 ht2)
+  (let ((res nil))
+    (dolist (key1 (ht-keys ht1)
+                  res)
+      (when (ht-contains? ht2 key1)
+        (push key1 res)))))
 
+(defun kubel--selected-and-visible ()
+  (kubel--set-intersection
+   kubel--selected-items-set
+   kubel--ns-name->visible))
 
 (defun kubel--make-view-calls ()
   "A function to make all the calls needed to form the view. Returns a list
@@ -1091,14 +1104,14 @@ ENTRYLIST is the output of the parsed body."
       (funcall kubel--get-entry colnum)))
   (cl-map 'vector #'kubel--get-column-entry (number-sequence 0 (- (kubel--ncols entrylist) 1))))
 
-;; TODO: is this the correct behaviour? should we instead build intersection between
-;; visible and selected items for the operations that work on selections?
+;; TODO: this is redundant; we should not operate on items selected but not visible
+;; but also we shouldn't remove the selected items here
 (defun kubel--update-selected-items ()
-  "Check that all selected items still exist."
-  (dolist (ns-name (ht-keys kubel--selected-items-set))
-    (unless (and (ht-contains? kubel--ns-name->columns-alist ns-name)
-                 (ht-get kubel--ns-name->visible ns-name))
-      (ht-remove kubel--selected-items-set ns-name))))
+  "Check that all selected items still exist.")
+  ;; (dolist (ns-name (kubel--selected-and-visible))
+  ;;   (unless (and (ht-contains? kubel--ns-name->columns-alist ns-name)
+  ;;                (ht-get kubel--ns-name->visible ns-name))
+  ;;     (ht-remove kubel--selected-items-set ns-name))))
 
 (defun kubel--get-list-entries ()
   "Get the entries.
@@ -1254,9 +1267,14 @@ If MAX is the end of the line, dynamically adjust."
 (comment
  (kubel--get-percentage "0% (-/2.0)"))
 
+;; TODO: remove this?
+;; (defun kubel--items-selected? ()
+;;   "Return non-nil if there are items selected."
+;;   (not (ht-empty? kubel--selected-items-set)))
+
 (defun kubel--items-selected? ()
   "Return non-nil if there are items selected."
-  (not (ht-empty? kubel--selected-items-set)))
+  (not (null (kubel--selected-and-visible))))
 
 (defun kubel--propertize-item (ns-name item)
   "Return the propertized item fields.
@@ -1343,29 +1361,35 @@ CALLBACK is called when process completes successfully.
           (kubel--append-to-process-buffer (format "error: %s" err))
           (error (format "Kubel process %s error: %s" process-name err)))))))
 
-(defun kubel--exec (process-name ns op-type args &optional readonly callback)
+(defun kubel--exec (process-name ns op-type args &optional readonly callback buf-name)
   "Utility function to run commands in the proper context and namespace.
 
 PROCESS-NAME is an identifier for the process.  Default to \"kubel-command\".
 NS is namespace in which the operation should be performed. nil means no namespace.
 OP-TYPE is a type of operation being performed.
 ARGS is a list of arguments.
+READONLY If true buffer will be in readonly mode(view-mode).
 CALLBACK is a function that will be executed when the command completes.
-READONLY If true buffer will be in readonly mode(view-mode)."
+BUF-NAME is used as output buffer name if set."
   (when (equal process-name "")
     (setq process-name "kubel-command"))
 
   (let* ((buffer-action (if (asoc-contains-key? kubel--op->buffer-action op-type)
                             (asoc-get kubel--op->buffer-action op-type)
                           'pop))
-         (buffer-name (cond ((eq buffer-action 'accumulate)
-                             kubel--output-buffer-name)
-                            (t
-                             (format "*kubel-resource:%s:%s:%s*" kubel-context ns (string-join args "_")))))
+         (buffer-name (cond
+                       ((and (not (null buf-name))
+                             (not (s-blank? buf-name)))
+                        buf-name)
+                       ((eq buffer-action 'accumulate)
+                        kubel--output-buffer-name)
+                       (t
+                        (format "*kubel-resource:%s:%s:%s*" kubel-context ns (string-join args "_")))))
          (error-buffer (kubel--process-error-buffer))
          (cmd (append (list kubel-kubectl) (kubel--get-context-kubectl-arg) (kubel--get-ns-kubectl-arg ns) args)))
     (when (and (get-buffer buffer-name)
-               (not (eq buffer-action 'accumulate)))
+               (not (eq buffer-action 'accumulate))
+               (not (eq buffer-action 'accumulate-comint)))
       (kill-buffer buffer-name))
 
     (kubel--log-command process-name cmd)
@@ -1378,16 +1402,27 @@ READONLY If true buffer will be in readonly mode(view-mode)."
                   :command cmd)
     (cond ((eq buffer-action 'pop)
            (pop-to-buffer buffer-name))
+
           ((eq buffer-action 'pop-comint)
            (pop-to-buffer buffer-name)
            (with-current-buffer buffer-name
              (comint-mode)))
+
           ((eq buffer-action 'accumulate)
            ;; TODO: this is incorrect, but we'll figure it out
            (display-buffer buffer-name
                            '((display-buffer-reuse-window)
                              (inhibit-same-window . t))
                            t))
+
+          ((eq buffer-action 'accumulate-comint)
+           (display-buffer buffer-name
+                           '((display-buffer-reuse-window)
+                             (inhibit-same-window . t))
+                           t)
+           (with-current-buffer buffer-name
+             (comint-mode)))
+
           (t (pop-to-buffer buffer-name)))
     (if readonly
         (with-current-buffer buffer-name
@@ -1733,7 +1768,7 @@ TYPE is containers or initContainers."
    (list (transient-args 'kubel-log-popup)))
   (dolist (pod (if (kubel--pod-view?)
                    (if (kubel--items-selected?)
-                       (ht-keys kubel--selected-items-set)
+                       (kubel--selected-and-visible)
                      (list (kubel--get-ns-name-under-cursor)))
                  (list (kubel--select-resource "Pods"))))
     (let* ((ns (car pod))
@@ -1746,6 +1781,36 @@ TYPE is containers or initContainers."
            (process-name (format "kubel - logs - %s/%s - %s" ns name container)))
       (kubel--exec process-name ns (if (kubel--follow-logs-mode? args) 'logs-follow 'logs)
                    (append '("logs") (kubel--default-tail-arg args) (list name container)) t nil))))
+
+;; FIXME: second version, to gather multiple pod logs into one buffer
+;; TODO: merge with the above single-pod version
+;; TODO: make it optional to accumulate logs in one buffer
+;; TODO: add colors based on the resource
+(defun kubel-get-pod-logs (&optional args type)
+  "Get the last N logs of the pod under the cursor.
+
+ARGS is the arguments list from transient.
+TYPE is containers or initContainers."
+  (interactive
+   (list (transient-args 'kubel-log-popup)))
+  (setq kubel--multiple-buffer-counter (1+ kubel--multiple-buffer-counter))
+  (dolist (pod (if (kubel--pod-view?)
+                   (if (kubel--items-selected?)
+                       (kubel--selected-and-visible)
+                     (list (kubel--get-ns-name-under-cursor)))
+                 (list (kubel--select-resource "Pods"))))
+    (let* ((ns (car pod))
+           (name (cdr pod))
+           (type (or type "containers"))
+           (containers (kubel--get-containers ns name type))
+           (container (if (equal (length containers) 1)
+                          (car containers)
+                        (completing-read "Select container: " containers)))
+           (process-name (format "kubel - logs - %s/%s - %s" ns name container)))
+      (kubel--exec process-name ns (if (kubel--follow-logs-mode? args) 'logs-follow-multiple 'logs-multiple)
+                   (append '("logs") (kubel--default-tail-arg args)
+                           '("--prefix" "--timestamps")
+                           (list name container)) t nil (format "*kubel-logs:multiple-%d*" kubel--multiple-buffer-counter)))))
 
 (defun kubel-get-pod-logs--initContainer (&optional args)
   "Get the last N logs of the pod under the cursor.
@@ -2114,7 +2179,7 @@ the variables `kubel-namespace' and `kubel-context', respectively."
   "Kubectl delete resource under cursor."
   (interactive)
   (dolist (resource (if (kubel--items-selected?)
-                        (ht-keys kubel--selected-items-set)
+                        (kubel--selected-and-visible)
                       (list (kubel--get-ns-name-under-cursor))))
     (let* ((ns (car resource))
            (name (cdr resource))
@@ -2123,6 +2188,7 @@ the variables `kubel-namespace' and `kubel-context', respectively."
      (when (transient-args 'kubel-delete-popup)
        (setq args (append args (list "--force" "--grace-period=0"))))
      (kubel--exec process-name ns 'delete args)
+     (ht-remove kubel--selected-items-set resource)
      (kubel-refresh))))
 
 (defun kubel-jab-deployment ()
@@ -2132,7 +2198,7 @@ See https://github.com/kubernetes/kubernetes/issues/27081"
   (interactive)
   (dolist (deployment (if (kubel--deployment-view?)
                           (if (kubel--items-selected?)
-                              (ht-keys kubel--selected-items-set)
+                              (kubel--selected-and-visible)
                             (list (kubel--get-ns-name-under-cursor)))
                         (list (kubel--select-resource "Deployments"))))
     (let* ((ns (car deployment))
@@ -2250,7 +2316,7 @@ BACKWARD moves back one line if set."
 (defun kubel-mark-all ()
  "Mark all items."
  (interactive)
- (ht-clear kubel--selected-items-set)
+ ;; (ht-clear kubel--selected-items-set)
  (save-excursion
    (goto-char (point-min))
    (while (not (eobp))
@@ -2258,10 +2324,16 @@ BACKWARD moves back one line if set."
      (forward-line 1)))
  (kubel-refresh t))
 
-(defun kubel-unmark-all ()
-  "Unmark all items."
-  (interactive)
-  (ht-clear kubel--selected-items-set)
+(defun kubel-unmark-all (&optional invisible)
+  "Unmark all items.
+
+Invoke with universal prefix argument to unmark even currently invisible items."
+  (interactive "P")
+  (if invisible
+      (ht-clear kubel--selected-items-set)
+    (let ((visible (kubel--selected-and-visible)))
+      (dolist (ns-name visible)
+        (ht-remove kubel--selected-items-set ns-name))))
   (kubel-refresh t))
 
 (defun kubel--read-buffer ()
@@ -2298,12 +2370,13 @@ RESOURCE-TYPE is a resource-type."
       (if (member possible-alias (kubel--kubernetes-api-resources-list))
           (setq alias possible-alias)))))
 
+;; FIXME: do we really need to clear selection here?
 (defun kubel--select-only (ns name)
   "Utility function to set selected items to a single item.
 
 NS is object's namespace.
 NAME is object's name."
-  (ht-clear kubel--selected-items-set)
+  ;; (ht-clear kubel--selected-items-set)
   (ht-set kubel--selected-items-set (cons ns name) t))
 
 (defun kubel-jump-to-owner ()
@@ -2609,6 +2682,8 @@ DIRECTORY is optional for TRAMP support."
            (not (kubel--resource-type-global? kubel-resource-type)))
       (setq kubel--all-namespaces-view t)
     (setq kubel--all-namespaces-view nil))
+  ;; reset visibility before re-populating the object list
+  (ht-clear kubel--ns-name->visible)
   (let ((entries (kubel--populate-list no-refresh)))
     (setq tabulated-list-format (car entries))
     (setq tabulated-list-entries (cadr entries)))   ; TODO handle "No resource found"
