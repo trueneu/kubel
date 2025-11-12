@@ -384,11 +384,26 @@ CMD is the command string to run."
     (with-current-buffer standard-output
       (shell-command cmd t kubel--output-buffer-name))))
 
-(defvar-local kubel-namespace "default"
+;; TODO: gracefully fallback to defaults when changing context if ns/resource-type don't exist
+(defvar kubel--last-namespace nil)
+(defvar kubel--last-resource-type nil)
+
+;; TODO: come up with a sane strategy to append kubel--buffer-counter
+(defvar kubel--buffer-counter 0)
+
+(defvar-local kubel-namespace
+  "default"
   "Current namespace.")
 
-(defvar-local kubel-resource-type "pods"
+(defvar-local kubel-resource-type
+  "pods"
   "Current resource type.")
+
+(defun kubel--set-ns-resource-type ()
+  (when kubel--last-namespace
+    (setq kubel-namespace kubel--last-namespace))
+  (when kubel--last-resource-type
+    (setq kubel-resource-type kubel--last-resource-type)))
 
 (defvar-local kubel-context
   (replace-regexp-in-string
@@ -1361,7 +1376,8 @@ CALLBACK is called when process completes successfully.
           (kubel--append-to-process-buffer (format "error: %s" err))
           (error (format "Kubel process %s error: %s" process-name err)))))))
 
-(defun kubel--exec (process-name ns op-type args &optional readonly callback buf-name)
+;; TODO: instead of forming buffer name from args, form it from ns-name name portion
+(defun kubel--exec (process-name ns op-type args &optional readonly callback buf-name new-window?)
   "Utility function to run commands in the proper context and namespace.
 
 PROCESS-NAME is an identifier for the process.  Default to \"kubel-command\".
@@ -1384,7 +1400,7 @@ BUF-NAME is used as output buffer name if set."
                        ((eq buffer-action 'accumulate)
                         kubel--output-buffer-name)
                        (t
-                        (format "*kubel-resource:%s:%s:%s*" kubel-context ns (string-join args "_")))))
+                        (format "*kubel:%s:%s:%s*" kubel-context ns (string-join args "_")))))
          (error-buffer (kubel--process-error-buffer))
          (cmd (append (list kubel-kubectl) (kubel--get-context-kubectl-arg) (kubel--get-ns-kubectl-arg ns) args)))
     (when (and (get-buffer buffer-name)
@@ -1401,29 +1417,35 @@ BUF-NAME is used as output buffer name if set."
                   :stderr nil
                   :command cmd)
     (cond ((eq buffer-action 'pop)
-           (pop-to-buffer buffer-name))
+           (pop-to-buffer buffer-name
+                          (if new-window? '((display-buffer-reuse-window)
+                                            (inhibit-same-window . t)))))
 
           ((eq buffer-action 'pop-comint)
-           (pop-to-buffer buffer-name)
+           (pop-to-buffer buffer-name
+                          (if new-window? '((display-buffer-reuse-window)
+                                            (inhibit-same-window . t))))
            (with-current-buffer buffer-name
              (comint-mode)))
 
           ((eq buffer-action 'accumulate)
            ;; TODO: this is incorrect, but we'll figure it out
            (display-buffer buffer-name
-                           '((display-buffer-reuse-window)
-                             (inhibit-same-window . t))
+                           (if new-window? '((display-buffer-reuse-window)
+                                             (inhibit-same-window . t)))
                            t))
 
           ((eq buffer-action 'accumulate-comint)
            (display-buffer buffer-name
-                           '((display-buffer-reuse-window)
-                             (inhibit-same-window . t))
+                           (if new-window? '((display-buffer-reuse-window)
+                                             (inhibit-same-window . t)))
                            t)
            (with-current-buffer buffer-name
              (comint-mode)))
 
-          (t (pop-to-buffer buffer-name)))
+          (t (pop-to-buffer buffer-name
+                            (if new-window? '((display-buffer-reuse-window)
+                                            (inhibit-same-window . t))))))
     (if readonly
         (with-current-buffer buffer-name
           (view-mode)))))
@@ -1620,17 +1642,26 @@ TYPENAME is the resource type/name."
   "Return non-nil if this is the pod view."
   (equal (capitalize kubel-resource-type) "Nodes"))
 
+;; TODO: generalize these using type-aliases structure
 (defun kubel--deployment-view? ()
   "Return non-nil if this is a deployment view."
   (-contains? '("Deployments" "deployments" "deployments.apps") kubel-resource-type))
 
-;; TODO: generalize this somehow?
+(defun kubel--replicaset-view? ()
+  (-contains? '("ReplicaSets" "replicasets" "replicasets.apps") kubel-resource-type))
+
+(defun kubel--statefulset-view? ()
+  (-contains? '("StatefulSets" "statefulsets" "statefulsets.apps") kubel-resource-type))
+
+(defun kubel--daemonset-view? ()
+  (-contains? '("DaemonSets" "daemonsets" "daemonsets.apps") kubel-resource-type))
+
 (defun kubel--is-scalable ()
   "Return non-nil if the resource can be scaled."
   (or
    (kubel--deployment-view?)
-   (-contains? '("ReplicaSets" "replicasets" "replicasets.apps") kubel-resource-type)
-   (-contains? '("StatefulSets" "statefulsets" "statefulsets.apps") kubel-resource-type)))
+   (kubel--replicaset-view?)
+   (kubel--statefulset-view?)))
 
 (defun kubel-kill-buffer ()
   "Kill the current buffer."
@@ -1735,6 +1766,7 @@ OPERATION is a string, a kubectl verb (apply, delete, etc)"
       (setq kubel-namespace ns)
       (setq kubel-resource-type res))))
 
+;; FIXME: this can be simplified
 (defun kubel--default-tail-arg (args)
   "Ugly function to make sure that there is at least the default tail.
 
@@ -1783,34 +1815,57 @@ TYPE is containers or initContainers."
                    (append '("logs") (kubel--default-tail-arg args) (list name container)) t nil))))
 
 ;; FIXME: second version, to gather multiple pod logs into one buffer
-;; TODO: merge with the above single-pod version
-;; TODO: make it optional to accumulate logs in one buffer
 ;; TODO: add colors based on the resource
-(defun kubel-get-pod-logs (&optional args type)
+(defun kubel--remove-seq (seq seq-remove)
+  (let ((res seq))
+    (dolist (element seq-remove res)
+      (setq res (remove element res)))))
+
+(comment
+ (kubel--remove-seq '(1 2 3) '(1 3)))
+
+(defun kubel-get-pod-logs (&optional args)
   "Get the last N logs of the pod under the cursor.
 
 ARGS is the arguments list from transient.
 TYPE is containers or initContainers."
   (interactive
    (list (transient-args 'kubel-log-popup)))
-  (setq kubel--multiple-buffer-counter (1+ kubel--multiple-buffer-counter))
-  (dolist (pod (if (kubel--pod-view?)
-                   (if (kubel--items-selected?)
-                       (kubel--selected-and-visible)
-                     (list (kubel--get-ns-name-under-cursor)))
-                 (list (kubel--select-resource "Pods"))))
-    (let* ((ns (car pod))
-           (name (cdr pod))
-           (type (or type "containers"))
-           (containers (kubel--get-containers ns name type))
-           (container (if (equal (length containers) 1)
-                          (car containers)
-                        (completing-read "Select container: " containers)))
-           (process-name (format "kubel - logs - %s/%s - %s" ns name container)))
-      (kubel--exec process-name ns (if (kubel--follow-logs-mode? args) 'logs-follow-multiple 'logs-multiple)
-                   (append '("logs") (kubel--default-tail-arg args)
-                           '("--prefix" "--timestamps")
-                           (list name container)) t nil (format "*kubel-logs:multiple-%d*" kubel--multiple-buffer-counter)))))
+  (let* ((selected-items (kubel--selected-and-visible))
+         (multimode? (and selected-items
+                          (< 1 (length selected-items))))
+         (collate? (transient-arg-value "collate" args))
+         (init-containers? (transient-arg-value "initContainers" args))
+         (args-switches (kubel--remove-seq args '("collate" "initContainers")))
+         (op-type (if (and collate? multimode?)
+                      (if (kubel--follow-logs-mode? args-switches) 'logs-follow-multiple 'logs-multiple)
+                    (if (kubel--follow-logs-mode? args-switches) 'logs-follow 'logs)))
+         (kind kubel-resource-type)) ;; save it, if opening multiple buffers, it'll get reset
+    (when (and collate? multimode?)
+      (setq kubel--multiple-buffer-counter (1+ kubel--multiple-buffer-counter)))
+
+    (dolist (ns-name (if multimode?
+                         selected-items
+                       (list (kubel--get-ns-name-under-cursor))))
+      (let* ((ns (car ns-name))
+             (name (cdr ns-name))
+             (process-name (format "kubel - logs - %s/%s" ns name))
+             (container (when (and (not multimode?) (kubel--pod-view?))
+                          (let* ((type (if init-containers? "initContainers" "containers"))
+                                 (containers (kubel--get-containers ns name type)))
+                            (if (equal (length containers) 1)
+                             (car containers)
+                             (completing-read "Select container: " containers))))))
+
+        (kubel--exec process-name ns op-type
+                     (append '("logs") (kubel--default-tail-arg args-switches)
+                             (if container
+                                 (list (format "%s/%s" kind name) "-c" container)
+                               (list (format "%s/%s" kind name))))
+                     t nil
+                     (when (and collate? multimode?)
+                       (format "*kubel-logs:multiple-%d*" kubel--multiple-buffer-counter))
+                     t)))))
 
 (defun kubel-get-pod-logs--initContainer (&optional args)
   "Get the last N logs of the pod under the cursor.
@@ -1820,7 +1875,7 @@ ARGS is the arguments list from transient."
    (list (transient-args 'kubel-log-popup)))
   (kubel-get-pod-logs args "initContainers"))
 
-;; this command doesn't make sense in the all-namespaces context
+;; FIXME: this command doesn't make sense in the all-namespaces context
 (defun kubel-get-logs-by-labels (&optional args)
   "Get the last N logs of the pods by labels.
 ARGS is the arguments list from transient."
@@ -1909,37 +1964,41 @@ ARGS is the arguments list from transient."
   (unless (member namespace kubel-namespace-history)
     (push namespace kubel-namespace-history)))
 
-(defun kubel-set-namespace (&optional refresh)
-  "Set the namespace.
-If called with a prefix argument REFRESH, refreshes
-the context caches, including the cached resource list."
-  (interactive "P")
-  (when refresh (kubel--invalidate-context-caches))
+(defun kubel-set-namespace (&optional args)
+  "Set the namespace."
+  (interactive (list (transient-args 'kubel-configure-popup)))
   (let* ((namespace (completing-read "Namespace: "
                                      (kubel--list-namespace)
                                      nil nil nil nil "default"))
          (kubel--buffer (get-buffer (kubel--buffer-name)))
          (last-default-directory (when kubel--buffer
-                                   (with-current-buffer kubel--buffer default-directory))))
+                                   (with-current-buffer kubel--buffer default-directory)))
+         (other-window? (transient-arg-value "window" args)))
+    (setq kubel--last-namespace namespace)
     (with-current-buffer (clone-buffer)
       (setq kubel-namespace namespace)
       (kubel--add-namespace-to-history namespace)
-      (switch-to-buffer (current-buffer))
+      (if other-window?
+          (switch-to-buffer-other-window (current-buffer))
+        (switch-to-buffer (current-buffer)))
       (kubel-refresh nil last-default-directory))))
 
-(defun kubel-set-context ()
+(defun kubel-set-context (&optional args)
   "Set the context."
-  (interactive)
+  (interactive (list (transient-args 'kubel-configure-popup)))
   (let* ((kubel--buffer (get-buffer (kubel--buffer-name)))
-         (last-default-directory (when kubel--buffer (with-current-buffer kubel--buffer default-directory))))
+         (last-default-directory (when kubel--buffer (with-current-buffer kubel--buffer default-directory)))
+         (other-window? (transient-arg-value "window" args)))
     (with-current-buffer (clone-buffer)
       (setq kubel-context
             (completing-read
              "Select context: "
              (split-string (kubel--exec-to-string (format "%s config view -o jsonpath='{.contexts[*].name}'" kubel-kubectl)) " ")))
       (kubel--invalidate-context-caches)
-      (setq kubel-namespace "default")
-      (switch-to-buffer (current-buffer))
+      (kubel--set-ns-resource-type)
+      (if other-window?
+          (switch-to-buffer-other-window (current-buffer))
+        (switch-to-buffer (current-buffer)))
       (kubel-refresh nil last-default-directory))))
 
 (defun kubel--add-selector-to-history (selectors)
@@ -2000,20 +2059,25 @@ the context caches, including the cached resource list."
   (split-string (kubel--exec-to-string
                  (format "%s --context %s api-resources -o name --no-headers=true" kubel-kubectl kubel-context)) "\n" t))
 
-(defun kubel-set-resource (&optional refresh)
-  "Set the resource.
-If called with a prefix argument REFRESH, refreshes
-the context caches, including the cached resource list."
-  (interactive "P")
-  (when refresh (kubel--invalidate-context-caches))
+(defun kubel-invalidate-caches ()
+  (interactive)
+  (kubel--invalidate-context-caches))
+
+(defun kubel-set-resource (&optional args)
+  "Set the resource type."
+  (interactive (list (transient-args 'kubel-configure-popup)))
   (let* ((current-buffer-name (kubel--buffer-name))
          (resource-list (kubel--kubernetes-api-resources-list))
          (kubel--buffer (get-buffer current-buffer-name))
-         (last-default-directory (when kubel--buffer (with-current-buffer kubel--buffer default-directory))))
+         (last-default-directory (when kubel--buffer (with-current-buffer kubel--buffer default-directory)))
+         (other-window? (transient-arg-value "window" args)))
     (with-current-buffer (clone-buffer)
       (setq kubel-resource-type
             (completing-read "Select resource: " resource-list))
-      (switch-to-buffer (current-buffer))
+      (setq kubel--last-resource-type kubel-resource-type)
+      (if other-window?
+          (switch-to-buffer-other-window (current-buffer))
+        (switch-to-buffer (current-buffer)))
       (kubel-refresh nil last-default-directory))))
 
 (defun kubel-set-output-format ()
@@ -2476,10 +2540,13 @@ NAME is object's name."
 
 (transient-define-prefix kubel-configure-popup ()
   "Kubel Configure Menu"
+  ["Switches"
+   ("o" "Open in other window" "window")]
   ["Actions"
    ("c" "Context" kubel-set-context)
    ("n" "Namespace" kubel-set-namespace)
    ("r" "Resource Type" kubel-set-resource)
+   ("i" "Invalidate caches" kubel-invalidate-caches)
    ("f" "Config file" kubel-set-kubectl-config-file)])
 
 (transient-define-prefix kubel-filtering-popup ()
@@ -2511,18 +2578,41 @@ NAME is object's name."
    ("c" "Children" kubel-jump-to-children)
    ("n" "Node" kubel-jump-to-node)])
 
+;; TODO: make some of these default?
+;; TODO: disable previous when it doesn't make sense
+;; TODO: dynamically enable --prefix if multimode?
+;; TODO: preserve initContainers functionality
+;; TODO: turn visibility on and off based on view
 (transient-define-prefix kubel-log-popup ()
   "Kubel Log Menu"
   ["Arguments"
    ("-f" "Follow" "-f")
    ("-t" "Timestamps" "--timestamps")
    ("-p" "Previous" "-p")
-   ("-n" "Tail" "--tail=")]
+   ("-x" "Print prefix" "--prefix")
+   ("-n" "Tail" "--tail=")
+   ("-C" "All containers" "--all-containers")
+   ("-P" "All pods" "--all-pods")]
+  ["Modes"
+   ("c" "Collate results" "collate")
+   ("i" "initContainers" "initContainers")]
   ["Actions"
    ("l" "Tail pod logs" kubel-get-pod-logs)
-   ("i" "Tail initContainer logs" kubel-get-pod-logs--initContainer)
-   ("L" "Tail by labels" kubel-get-logs-by-labels)])
+   ("I" "Tail initContainer logs" kubel-get-pod-logs--initContainer) ;; TODO: remove
+   ("L" "Tail by labels" kubel-get-logs-by-labels)
+   ("t" "test command" kubel--test-command)])
 
+(defun kubel--test-command (&optional args)
+  (interactive
+   (list (transient-args 'kubel-log-popup)))
+  (pp (transient-arg-value "collate" (transient-args 'kubel-log-popup)))
+  (pp (transient-args 'kubel-log-popup)))
+
+(comment
+ (kubel-log-popup)
+ (remove 3 '(1 2 3)))
+
+;; TODO: find out if it's possible to cleanly define a switch for a function in transient
 (transient-define-prefix kubel-copy-popup ()
   "Kubel Copy Menu"
   ["Actions"
@@ -2751,6 +2841,7 @@ DIRECTORY is optional for TRAMP support."
       (switch-to-buffer (current-buffer))
       (unless (eq major-mode 'kubel-mode)
         (kubel-mode))
+      (kubel--set-ns-resource-type)
       (kubel-refresh nil directory))))
 
 ;;;###autoload

@@ -116,12 +116,15 @@ Pods, nodes views (with CPU/MEM percentages)
 Events view
 CPU/MEM percentages have thresholds and respective faces
 Apply from anywhere
+Logs from any resource type
+Logs from multiple marked resources, collated or in separate buffers
 *** Behaviour
 Remapped keyboard to avoid overload
 Add unmark-item-backward command
 Add automatic movement for unmarking
 Show filter on the modeline, labels and field selectors in the buffer name
 Default to case-insensitive search when filtering
+Remember last chosen context, namespace and resource type
 *** Fixes
 Fixed error when showing rollout revisions (kubel--show-rollout-revision passes correct callback)
 Describe resource doesn't use kubel-yaml-mode anymore
@@ -154,11 +157,17 @@ CLOSED: [2025-09-28 Sun 19:17]
 CLOSED: [2025-10-10 Fri 14:06]
 ** convert hashtables to alists (what's the performance?)
 * TODO logs command must work with --all-containers switch, and deployments/statefulsets etc
-* TODO logs command must work with multiple pods selected
-* TODO namespace should not change when changing the context if exists in new context
+** deployments/statefulsets etc should look into spec.selector.matchLabels and work from there
+* DONE logs command must work with multiple pods selected
+CLOSED: [2025-11-12 Wed 01:17]
+* DONE namespace should not change when changing the context if exists in new context
+CLOSED: [2025-11-12 Wed 01:18]
+* TODO verify behaviour if namespace doesn't exist in new context after context change
 * TODO get/describe should work for multiple selected and visible resources, if any
 ** check if get/apply with C-c C-c is possible in this manner
 * TODO arbitrary application by selected region
+* TODO instead of controlling new-window? in exec, make transient pass C-o to underlying command
+* TODO sort by time when collating
 * DONE selected resources should remain selected if changing resource/ctx
 CLOSED: [2025-11-07 Fri 01:35]
 ** but no operations on invisible ones
