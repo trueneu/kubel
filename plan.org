@@ -175,6 +175,12 @@ CLOSED: [2025-11-07 Fri 01:35]
 * TODO fetch resources list and namespaces list in async manner
 When? Right after changing the context?
 ** renew them every X seconds maybe, otherwise if I create a namespace it's not visible
+* TODO sort the logs by timestamps even if the timestamp is not visible
+** always retrieve the timestamp
+** sort the lines by it (what's the quickest way?)
+https://www.gnu.org/software/emacs/manual/html_node/elisp/Sorting.html
+** maybe make a switch a-la k9s to display and hide timestamps
+** follow mode doesn't need additional logic, only initial collate
 * fix modeline regex filter displayed in every modeline instead of current buffer
 * test plan
 - [ ] get resource details view
