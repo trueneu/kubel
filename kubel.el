@@ -1249,7 +1249,7 @@ If MAX is the end of the line, dynamically adjust."
 
 (defun kubel--buffer-name-from-parameters (context namespace resource)
   "Return a preconfigured kubel buffer name."
-  (concat (format "*kubel:%s:%s:%s*" context namespace resource)))
+  (concat (format "kubel:%s:%s:%s" context namespace resource)))
 
 (defun kubel--buffer-name ()
   "Return kubel buffer name."
@@ -1400,7 +1400,7 @@ BUF-NAME is used as output buffer name if set."
                        ((eq buffer-action 'accumulate)
                         kubel--output-buffer-name)
                        (t
-                        (format "*kubel:%s:%s:%s*" kubel-context ns (string-join args "_")))))
+                        (format "kubel:%s:%s:%s" kubel-context ns (string-join args "_")))))
          (error-buffer (kubel--process-error-buffer))
          (cmd (append (list kubel-kubectl) (kubel--get-context-kubectl-arg) (kubel--get-ns-kubectl-arg ns) args)))
     (when (and (get-buffer buffer-name)
@@ -1445,7 +1445,7 @@ BUF-NAME is used as output buffer name if set."
 
           (t (pop-to-buffer buffer-name
                             (if new-window? '((display-buffer-reuse-window)
-                                            (inhibit-same-window . t))))))
+                                              (inhibit-same-window . t))))))
     (if readonly
         (with-current-buffer buffer-name
           (view-mode)))))
@@ -1864,7 +1864,7 @@ TYPE is containers or initContainers."
                                (list (format "%s/%s" kind name))))
                      t nil
                      (when (and collate? multimode?)
-                       (format "*kubel-logs:multiple-%d*" kubel--multiple-buffer-counter))
+                       (format "kubel-logs:multiple-%d" kubel--multiple-buffer-counter))
                      t)))))
 
 (defun kubel-get-pod-logs--initContainer (&optional args)
@@ -2406,7 +2406,7 @@ Invoke with universal prefix argument to unmark even currently invisible items."
          (other-name (buffer-name other-buffer))
          (buffers))
     (dolist (buf (buffer-list))
-      (when (string-prefix-p "*kubel:" (buffer-name buf))
+      (when (string-prefix-p "kubel:" (buffer-name buf))
         (push buf buffers)))
     (let ((predicate
            (lambda (buffer)
@@ -2697,6 +2697,7 @@ NAME is object's name."
     map)
   "Keymap for `kubel-mode'.")
 
+;; FIXME: mode-line-misc-info should be a list?
 (defun kubel--current-state ()
   "Show the current context, namespace, and resource in the Echo Area.
 Append filter to the modeline."
