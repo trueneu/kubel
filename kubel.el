@@ -1925,7 +1925,8 @@ ARGS is the arguments list from transient."
 
 (defun kubel-set-kubectl-config-file (configfile)
   "Set the path to the kubectl CONFIGFILE."
-  (interactive "f")
+  (interactive
+   (list (read-file-name "Kubeconfig: " "~/.kube" nil t)))
   (let ((configfile (or configfile "~/.kube/config")))
     (if (file-exists-p (expand-file-name configfile))
         (setenv "KUBECONFIG" (expand-file-name configfile))
